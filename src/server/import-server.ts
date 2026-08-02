@@ -471,7 +471,7 @@ app.get("/g/:childId", async (req, res) => {
               method:'POST', headers:{'Content-Type':'application/json'},
               body:JSON.stringify({
                 childId:'${c.id}', email,
-                assetIds:[...picked], products:selectedProducts()
+                assetIds:[...picked], productIds:selectedProducts().map(p=>p.id)
               })
             });
             const data=await r.json();
@@ -490,13 +490,13 @@ app.get("/g/:childId", async (req, res) => {
 app.post("/api/order", async (req, res) => {
   const client = await pool.connect();
   try {
-    const { childId, email, assetIds, products } = req.body as {
-      childId: string; email: string; assetIds: string[]; products: Array<{ id: string; name: string; cents: number }>;
+    const { childId, email, assetIds, productIds } = req.body as {
+      childId: string; email: string; assetIds: string[]; productIds: string[];
     };
     if (!childId || !email || !email.includes("@")) {
       return res.status(400).json({ message: "A valid email address is required." });
     }
-    if (!assetIds?.length || !products?.length) {
+    if (!assetIds?.length || !productIds?.length) {
       return res.status(400).json({ message: "Select at least one photograph and one product." });
     }
 
@@ -505,6 +505,42 @@ app.post("/api/order", async (req, res) => {
     );
     if (child.rowCount === 0) return res.status(404).json({ message: "Unknown child." });
     const { studio_id: studioId, school_id: schoolId } = child.rows[0];
+
+    // Every asset requested must actually belong to THIS child's gallery.
+    // Without this check, a crafted request could attach any asset id in the
+    // system — another child's, another school's — to an order placed under
+    // this child, mixing data across the isolation boundary the rest of the
+    // system spends so much effort enforcing.
+    const ownedAssets = await client.query(
+      `select asset_id from gallery_item where child_id = $1 and asset_id = any($2::uuid[])`,
+      [childId, assetIds],
+    );
+    if (ownedAssets.rowCount !== assetIds.length) {
+      return res.status(400).json({ message: "One or more selected photographs are not valid for this order." });
+    }
+
+    // Real prices, looked up now, from the studio's own published list — never
+    // the amount the browser happened to send. A client can compute a total to
+    // *display*, but it cannot set what is actually charged; that price comes
+    // from the same table src/server's admin Settings page edits, at the
+    // moment of ordering, not at the moment the page was rendered.
+    const priceList = await client.query(
+      `select id from price_list where studio_id = $1 and status = 'published'
+         order by effective_from desc limit 1`,
+      [studioId],
+    );
+    if (priceList.rowCount === 0) {
+      return res.status(400).json({ message: "No prices are currently published for this school." });
+    }
+    const priced = await client.query(
+      `select pr.product_id, pr.amount_cents, p.name_i18n->>'en' as name
+         from price pr join product p on p.id = pr.product_id
+        where pr.price_list_id = $1 and pr.product_id = any($2::uuid[]) and p.active = true`,
+      [priceList.rows[0].id, productIds],
+    );
+    if (priced.rowCount !== productIds.length) {
+      return res.status(400).json({ message: "One or more selected products are no longer available." });
+    }
 
     const shoot = await client.query(
       `select id from shoot where studio_id = $1 and school_id = $2 order by created_at desc limit 1`,
@@ -528,9 +564,9 @@ app.post("/api/order", async (req, res) => {
     let subtotal = 0;
     const lines: Array<{ productId: string; name: string; unitCents: number; qty: number; assetId: string }> = [];
     for (const assetId of assetIds) {
-      for (const p of products) {
-        lines.push({ productId: p.id, name: p.name, unitCents: p.cents, qty: 1, assetId });
-        subtotal += p.cents;
+      for (const p of priced.rows) {
+        lines.push({ productId: p.product_id, name: p.name, unitCents: p.amount_cents, qty: 1, assetId });
+        subtotal += p.amount_cents;
       }
     }
 
