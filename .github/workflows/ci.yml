@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports: ['5432:5432']
+
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      TEST_DB: spp_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test
+
+      # The important one. Applies every migration to a clean database and runs
+      # the RLS and invariant suites as app_rw — the role the application
+      # actually uses. A policy regression fails the build here rather than in
+      # production.
+      - name: Database and RLS tests
+        run: npm run db:test
+
+      # A table added without a policy is a table any authenticated actor can
+      # read. This check exists because the realistic failure is not writing a
+      # bad policy, it is forgetting a table.
+      - name: Assert RLS enabled on every table
+        run: |
+          UNPROTECTED=$(psql -d "$TEST_DB" -Atc "
+            select string_agg(c.relname, ', ')
+              from pg_class c
+              join pg_namespace n on n.oid = c.relnamespace
+             where n.nspname = 'public'
+               and c.relkind = 'r'
+               and c.relname <> 'schema_migration'
+               and not (c.relrowsecurity and c.relforcerowsecurity)")
+          if [ -n "$UNPROTECTED" ]; then
+            echo "::error::Tables without forced RLS: $UNPROTECTED"
+            exit 1
+          fi
+          echo "All tables have RLS enabled and forced."
+
+      - name: Assert every table has at least one policy
+        run: |
+          NOPOLICY=$(psql -d "$TEST_DB" -Atc "
+            select string_agg(c.relname, ', ')
+              from pg_class c
+              join pg_namespace n on n.oid = c.relnamespace
+             where n.nspname = 'public' and c.relkind = 'r'
+               and c.relname <> 'schema_migration'
+               and not exists (
+                 select 1 from pg_policies p
+                  where p.schemaname = 'public' and p.tablename = c.relname)")
+          if [ -n "$NOPOLICY" ]; then
+            echo "::error::Tables with RLS enabled but no policy (deny-all): $NOPOLICY"
+            exit 1
+          fi
