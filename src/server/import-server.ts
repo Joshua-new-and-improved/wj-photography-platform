@@ -983,7 +983,7 @@ app.get("/api/health", async (_req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n  Server running on port ${PORT}.`);
+  console.log(`\n  Server running on port ${PORT}. (auto-deploy pipeline verified)`);
   console.log(`  → /              parent claim entry`);
   console.log(`  → /admin         studio console (staff auth)`);
   console.log(`  → /import.html   import tool (staff auth)\n`);
