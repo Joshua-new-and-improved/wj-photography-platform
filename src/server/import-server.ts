@@ -982,6 +982,27 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
+// ── Maintenance: inspect and clear data through the app itself. ─────────────
+// The direct Postgres proxy port is not reachable from every network, so this
+// gives staff (and only staff — same auth as /admin) a way to see and remove
+// records without a raw database connection. delete-child is deliberately not
+// exposed anywhere in the UI: it is a maintenance tool for clearing test data,
+// not a feature, and it cascades to every dependent row via the same foreign
+// keys the schema already enforces.
+app.get("/admin/api/children", requireStaffAuth, async (_req, res) => {
+  const rows = await pool.query(
+    `select c.id, c.first_name, c.last_name, s.name as school_name, c.created_at
+       from child c join school s on s.id = c.school_id
+      order by c.created_at`,
+  );
+  res.json(rows.rows);
+});
+
+app.post("/admin/api/child/:id/delete", requireStaffAuth, async (req, res) => {
+  await pool.query(`delete from child where id = $1`, [req.params.id]);
+  res.json({ deleted: req.params.id });
+});
+
 app.listen(PORT, () => {
   console.log(`\n  Server running on port ${PORT}. (auto-deploy pipeline verified)`);
   console.log(`  → /              parent claim entry`);
