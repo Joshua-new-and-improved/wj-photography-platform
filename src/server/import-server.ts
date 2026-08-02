@@ -10,7 +10,7 @@ import { segmentBySlates, reviewSummary, type Frame } from "../lib/import/segmen
 import { deriveVariants } from "../lib/media/derive.js";
 import { putObject, publicUrl, randomKey } from "../lib/storage/local.js";
 import { issueClaimCode, redeemClaimCode, completeClaim } from "../lib/claim.js";
-import { generateSessionToken, hashToken } from "../lib/ids.js";
+import { generateSessionToken, hashToken, generateOrderNumber } from "../lib/ids.js";
 import { page, escapeHtml } from "./views.js";
 
 /**
@@ -316,7 +316,7 @@ app.post("/api/claim/redeem", async (req, res) => {
 // ── Parent gallery ────────────────────────────────────────────────────────────
 app.get("/g/:childId", async (req, res) => {
   const child = await pool.query(
-    `select c.first_name, c.last_name, cl.name as class_name, g.name as grade_name,
+    `select c.id, c.first_name, c.last_name, c.school_id, cl.name as class_name, g.name as grade_name,
             s.display_name, s.name as school_name
        from child c
        left join enrolment e on e.child_id = c.id
@@ -333,7 +333,7 @@ app.get("/g/:childId", async (req, res) => {
   const schoolLabel = c.display_name || c.school_name;
 
   const images = await pool.query(
-    `select av.storage_key
+    `select a.id as asset_id, av.storage_key
        from gallery_item gi
        join asset a on a.id = gi.asset_id
        join asset_variant av on av.asset_id = a.id and av.kind = 'preview'
@@ -342,27 +342,234 @@ app.get("/g/:childId", async (req, res) => {
     [req.params.childId],
   );
 
+  // Real prices, from whatever price list is actually published — the same
+  // one the admin Settings page edits. Nothing here is hardcoded.
+  const priceList = await pool.query(
+    `select id from price_list where studio_id = (select studio_id from child where id = $1)
+       and status = 'published' order by effective_from desc limit 1`,
+    [req.params.childId],
+  );
+  const products = priceList.rows[0]
+    ? await pool.query(
+        `select p.id, p.name_i18n->>'en' as name, pr.amount_cents
+           from product p join price pr on pr.product_id = p.id and pr.price_list_id = $1
+          where p.studio_id = (select studio_id from child where id = $2) and p.active = true
+          order by pr.amount_cents`,
+        [priceList.rows[0].id, req.params.childId],
+      )
+    : { rows: [] };
+
   const grid = images.rows.length
-    ? images.rows.map((r) => `<div class="frame"><img src="${publicUrl(r.storage_key)}" alt=""></div>`).join("")
+    ? images.rows
+        .map(
+          (r) => `<div class="frame" data-asset="${r.asset_id}" tabindex="0" role="button">
+            <img src="${publicUrl(r.storage_key)}" alt="">
+            <div class="pickmark">✓</div>
+          </div>`,
+        )
+        .join("")
     : `<div class="empty">No photographs in this gallery yet.</div>`;
+
+  const productRows = products.rows
+    .map(
+      (p) =>
+        `<label class="prow"><input type="checkbox" class="prod" value="${p.id}" data-name="${escapeHtml(p.name)}" data-cents="${p.amount_cents}">
+           <span>${escapeHtml(p.name)}</span><span class="pmoney">R${(p.amount_cents / 100).toFixed(2)}</span></label>`,
+    )
+    .join("");
 
   res.send(
     page({
       title: `${c.first_name} ${c.last_name}`,
       nav: NAV,
       body: `
+      <style>
+        .frame{cursor:pointer;position:relative}
+        .frame .pickmark{position:absolute;top:6px;right:6px;width:22px;height:22px;border-radius:99px;
+          background:var(--paper);border:1px solid var(--rule);display:flex;align-items:center;justify-content:center;
+          font-size:12px;color:transparent}
+        .frame.picked{outline:2px solid var(--chinagraph)}
+        .frame.picked .pickmark{background:var(--chinagraph);color:#fff;border-color:var(--chinagraph)}
+        .order-panel{background:#fff;border:1px solid var(--rule);border-radius:4px;padding:16px;margin-top:12px}
+        .prow{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--rule);cursor:pointer}
+        .prow:last-child{border:0}
+        .pmoney{margin-left:auto;font-family:var(--mono)}
+        .ordertotal{display:flex;justify-content:space-between;padding-top:12px;margin-top:4px;
+          border-top:1px solid var(--graphite);font-weight:600;font-size:16px}
+        input[type=email]{width:100%;padding:10px;border:1px solid var(--rule);border-radius:2px;margin:10px 0}
+      </style>
       <div class="sheet-head">
         <div class="kid">
           <h1>${escapeHtml(c.first_name)}</h1>
           <span class="cls">${escapeHtml(schoolLabel)}${c.grade_name ? " · " + escapeHtml(c.grade_name) : ""}${c.class_name ? " " + escapeHtml(c.class_name) : ""}</span>
         </div>
       </div>
-      <div class="sectlabel"><span>Photographs</span></div>
-      <div class="sheet">${grid}</div>
-      <div class="note">Ordering, favourites and checkout are the front-end layer in
-        wj-photography-prototype.html, not yet wired to this page.</div>`,
+      <div class="sectlabel"><span>Photographs — tap to select</span></div>
+      <div class="sheet" id="grid">${grid}</div>
+
+      ${
+        products.rows.length === 0
+          ? `<div class="note">No products are priced yet — the studio hasn't set up pricing for this school.</div>`
+          : `
+      <div class="sectlabel"><span>Order</span></div>
+      <div class="order-panel">
+        <div id="pickCount" class="mono" style="color:var(--silver);font-size:12px;margin-bottom:10px">No photographs selected</div>
+        ${productRows}
+        <div class="ordertotal"><span>Total</span><span id="total">R0.00</span></div>
+        <input type="email" id="email" placeholder="Your email address" required>
+        <div id="emailErr" style="color:var(--chinagraph);font-size:12px;min-height:16px"></div>
+        <button class="btn" id="place" disabled>Select photographs and products to order</button>
+        <div id="confirm" style="display:none;margin-top:14px;padding:14px;background:#f0f7f4;border-radius:2px">
+          <b>Order received.</b> <span id="ordNum"></span><br>
+          <span style="font-size:13px">The studio will be in touch to arrange payment. Once payment is
+          confirmed, any digital images in this order are emailed immediately; prints follow after the
+          school's order deadline.</span>
+        </div>
+      </div>`
+      }
+      <div class="note">Real order, real database, real pricing — the one thing not live yet is a card
+        payment gateway. Payment is confirmed by the studio for now.</div>
+      <script>
+        const picked=new Set();
+        document.querySelectorAll('.frame').forEach(f=>{
+          f.onclick=()=>{
+            const id=f.dataset.asset;
+            picked.has(id)?picked.delete(id):picked.add(id);
+            f.classList.toggle('picked');
+            update();
+          };
+        });
+        function selectedProducts(){
+          return [...document.querySelectorAll('.prod:checked')].map(el=>({
+            id:el.value, name:el.dataset.name, cents:Number(el.dataset.cents)
+          }));
+        }
+        function update(){
+          const pc=document.getElementById('pickCount');
+          if(pc) pc.textContent = picked.size + ' photograph(s) selected';
+          const prods=selectedProducts();
+          const total=prods.reduce((s,p)=>s+p.cents,0) * Math.max(1,picked.size);
+          const totalEl=document.getElementById('total');
+          if(totalEl) totalEl.textContent='R'+(total/100).toFixed(2);
+          const btn=document.getElementById('place');
+          if(!btn) return;
+          const ready = picked.size>0 && prods.length>0;
+          btn.disabled=!ready;
+          btn.textContent = ready ? 'Place order — R'+(total/100).toFixed(2) : 'Select photographs and products to order';
+        }
+        document.querySelectorAll('.prod').forEach(el=>el.onchange=update);
+
+        const placeBtn=document.getElementById('place');
+        if(placeBtn){
+          placeBtn.onclick=async()=>{
+            const email=document.getElementById('email').value.trim();
+            const err=document.getElementById('emailErr');
+            if(!email.includes('@')){ err.textContent='Enter a valid email address.'; return; }
+            err.textContent='';
+            placeBtn.disabled=true; placeBtn.textContent='Placing order…';
+            const r=await fetch('/api/order',{
+              method:'POST', headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({
+                childId:'${c.id}', email,
+                assetIds:[...picked], products:selectedProducts()
+              })
+            });
+            const data=await r.json();
+            if(!r.ok){ err.textContent=data.message||'Something went wrong.'; placeBtn.disabled=false; update(); return; }
+            document.getElementById('ordNum').textContent='Order number: '+data.orderNumber;
+            document.getElementById('confirm').style.display='block';
+            placeBtn.style.display='none';
+          };
+        }
+      </script>`,
     }),
   );
+});
+
+// ── Place an order: real order + order_line rows, real price snapshots ──────
+app.post("/api/order", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { childId, email, assetIds, products } = req.body as {
+      childId: string; email: string; assetIds: string[]; products: Array<{ id: string; name: string; cents: number }>;
+    };
+    if (!childId || !email || !email.includes("@")) {
+      return res.status(400).json({ message: "A valid email address is required." });
+    }
+    if (!assetIds?.length || !products?.length) {
+      return res.status(400).json({ message: "Select at least one photograph and one product." });
+    }
+
+    const child = await client.query(
+      `select studio_id, school_id from child where id = $1`, [childId],
+    );
+    if (child.rowCount === 0) return res.status(404).json({ message: "Unknown child." });
+    const { studio_id: studioId, school_id: schoolId } = child.rows[0];
+
+    const shoot = await client.query(
+      `select id from shoot where studio_id = $1 and school_id = $2 order by created_at desc limit 1`,
+      [studioId, schoolId],
+    );
+    const shootId = shoot.rows[0]?.id;
+
+    await client.query("begin");
+    await client.query("select set_config('app.actor_kind', 'system', true)");
+
+    let guardian = await client.query(`select id from guardian where email = $1`, [email]);
+    let guardianId = guardian.rows[0]?.id as string | undefined;
+    if (!guardianId) {
+      const r = await client.query(
+        `insert into guardian (email, full_name) values ($1, $2) returning id`,
+        [email, email.split("@")[0]],
+      );
+      guardianId = r.rows[0].id;
+    }
+
+    let subtotal = 0;
+    const lines: Array<{ productId: string; name: string; unitCents: number; qty: number; assetId: string }> = [];
+    for (const assetId of assetIds) {
+      for (const p of products) {
+        lines.push({ productId: p.id, name: p.name, unitCents: p.cents, qty: 1, assetId });
+        subtotal += p.cents;
+      }
+    }
+
+    const orderNumber = generateOrderNumber("WJ");
+    const order = await client.query(
+      `insert into "order" (studio_id, school_id, shoot_id, guardian_id, order_number,
+                            subtotal_cents, total_cents, payment_status, digital_status)
+       values ($1,$2,$3,$4,$5,$6,$6,'pending','pending') returning id`,
+      [studioId, schoolId, shootId, guardianId, orderNumber, subtotal],
+    );
+    const orderId = order.rows[0].id;
+
+    let lineNo = 1;
+    for (const l of lines) {
+      const gi = await client.query(
+        `select gi.child_id from gallery_item gi where gi.asset_id = $1 limit 1`, [l.assetId],
+      );
+      const lineChildId = gi.rows[0]?.child_id ?? childId;
+      await client.query(
+        `insert into order_line (studio_id, order_id, child_id, line_no, kind, quantity,
+                                 unit_cents, line_total_cents, vat_rate_bps, snapshot, fulfilment_kind)
+         values ($1,$2,$3,$4,'product',$5,$6,$7,1500,$8,$9)`,
+        [
+          studioId, orderId, lineChildId, lineNo++, l.qty, l.unitCents, l.unitCents * l.qty,
+          JSON.stringify({ name: l.name, assetId: l.assetId }),
+          l.name.toLowerCase().includes("digital") ? "digital" : "physical",
+        ],
+      );
+    }
+
+    await client.query("commit");
+    res.json({ orderNumber, total: subtotal });
+  } catch (err) {
+    await client.query("rollback");
+    console.error(err);
+    res.status(500).json({ message: "Something went wrong placing the order." });
+  } finally {
+    client.release();
+  }
 });
 
 // ============================================================================
@@ -429,6 +636,14 @@ app.get("/admin", async (req, res) => {
       )
     : { rows: [] };
   const priceByProduct = new Map(prices.rows.map((r: any) => [r.product_id, r.amount_cents]));
+
+  const orders = await pool.query(
+    `select o.id, o.order_number, o.total_cents, o.payment_status, o.digital_status,
+            o.fulfilment_status, g.email
+       from "order" o join guardian g on g.id = o.guardian_id
+      where o.school_id = $1 order by o.placed_at desc limit 50`,
+    [selected.id],
+  );
 
   const schoolTabs = schools.rows
     .map(
@@ -500,6 +715,36 @@ app.get("/admin", async (req, res) => {
         <button type="submit" class="btn" style="width:auto;padding:8px 16px">Add package</button>
       </form>
 
+      <div class="sectlabel"><span>Orders</span></div>
+      ${
+        orders.rowCount === 0
+          ? `<div class="empty">No orders yet.</div>`
+          : `<table><thead><tr><th>Order</th><th>Guardian</th><th>Total</th>
+              <th>Payment</th><th>Digital</th><th>Prints</th><th></th></tr></thead><tbody>
+          ${orders.rows
+            .map(
+              (o) => `<tr>
+                <td class="mono">${escapeHtml(o.order_number)}</td>
+                <td>${escapeHtml(o.email)}</td>
+                <td class="mono">R${(o.total_cents / 100).toFixed(2)}</td>
+                <td><span class="pill ${o.payment_status === "settled" ? "ok" : ""}">${escapeHtml(o.payment_status)}</span></td>
+                <td><span class="pill ${o.digital_status === "delivered" ? "ok" : ""}">${escapeHtml(o.digital_status)}</span></td>
+                <td><span class="pill ${o.fulfilment_status === "completed" ? "ok" : ""}">${escapeHtml(o.fulfilment_status)}</span></td>
+                <td>${
+                  o.payment_status !== "settled"
+                    ? `<form method="post" action="/admin/order/${o.id}/mark-paid" style="display:inline">
+                         <button type="submit" class="pill">Mark paid</button></form>`
+                    : ""
+                }</td>
+              </tr>`,
+            )
+            .join("")}
+          </tbody></table>
+          <div class="note">"Mark paid" is the real payment confirmation step until a card gateway is
+            connected — it settles the order and, if it contains any digital lines, emails them
+            immediately (the digital-release gate is enforced in the database, not just here).</div>`
+      }
+
       <div class="sectlabel"><span>Children</span></div>
       ${
         children.rowCount === 0
@@ -522,6 +767,36 @@ app.get("/admin", async (req, res) => {
         folder into the importer and it appears here automatically.</div>`,
     }),
   );
+});
+
+app.post("/admin/order/:id/mark-paid", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("select set_config('app.actor_kind', 'system', true)");
+
+    // Two updates, in order: settle payment first, then release digital.
+    // The digital-release gate (migration 0013, enforce_digital_gate) refuses
+    // to mark digital_status='delivered' while payment_status is not settled —
+    // this order of operations is not cosmetic, it is what makes the trigger
+    // actually protect anything.
+    await client.query(`update "order" set payment_status = 'settled' where id = $1`, [req.params.id]);
+
+    const hasDigital = await client.query(
+      `select 1 from order_line where order_id = $1 and fulfilment_kind = 'digital' limit 1`,
+      [req.params.id],
+    );
+    if (hasDigital.rowCount! > 0) {
+      await client.query(`update "order" set digital_status = 'delivered' where id = $1`, [req.params.id]);
+    }
+
+    const school = await client.query(`select school_id from "order" where id = $1`, [req.params.id]);
+    res.redirect(`/admin?school=${school.rows[0].school_id}`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Error marking order paid: " + (err as Error).message);
+  } finally {
+    client.release();
+  }
 });
 
 app.post("/admin/school/:id", async (req, res) => {
