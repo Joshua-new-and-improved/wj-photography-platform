@@ -1314,6 +1314,51 @@ app.post("/admin/api/child/:id/delete", requireStaffAuth, async (req, res) => {
   res.json({ deleted: req.params.id });
 });
 
+app.get("/admin/api/schools", requireStaffAuth, async (_req, res) => {
+  const rows = await pool.query(
+    `select s.id, s.name, s.display_name,
+            (select count(*) from child c where c.school_id = s.id) as children
+       from school s order by s.name`,
+  );
+  res.json(rows.rows);
+});
+
+app.post("/admin/api/school/:id/delete", requireStaffAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const id = req.params.id;
+    // Dependent rows are deleted in dependency order rather than relying on
+    // cascade — most foreign keys in this schema are RESTRICT deliberately
+    // (§5.4: soft state, not soft delete, is the default), so a maintenance
+    // tool that actually needs hard deletion has to walk the graph itself.
+    await client.query(
+      `delete from gallery_item where asset_id in (select id from asset where shoot_id in
+         (select id from shoot where school_id = $1))`, [id],
+    );
+    await client.query(
+      `delete from asset_variant where asset_id in (select id from asset where shoot_id in
+         (select id from shoot where school_id = $1))`, [id],
+    );
+    await client.query(`delete from asset where shoot_id in (select id from shoot where school_id = $1)`, [id]);
+    await client.query(`delete from claim_code where shoot_id in (select id from shoot where school_id = $1)`, [id]);
+    await client.query(`delete from shoot where school_id = $1`, [id]);
+    await client.query(`delete from enrolment where class_group_id in
+      (select id from class_group where school_id = $1)`, [id]);
+    await client.query(`delete from class_group where school_id = $1`, [id]);
+    await client.query(`delete from grade where school_id = $1`, [id]);
+    await client.query(`delete from child where school_id = $1`, [id]);
+    await client.query(`delete from school where id = $1`, [id]);
+    await client.query("commit");
+    res.json({ deleted: id });
+  } catch (err) {
+    await client.query("rollback");
+    res.status(500).json({ error: (err as Error).message });
+  } finally {
+    client.release();
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`\n  Server running on port ${PORT}. (auto-deploy pipeline verified)`);
   console.log(`  → /              parent claim entry`);
