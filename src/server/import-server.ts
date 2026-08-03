@@ -79,7 +79,45 @@ app.use((req, _res, next) => {
 });
 
 const STORAGE_ROOT = process.env.STORAGE_ROOT ?? new URL("../../storage", import.meta.url).pathname;
-app.use("/storage", express.static(STORAGE_ROOT));
+
+/**
+ * Security headers.
+ *
+ * Cheap, and they close off whole categories of attack: clickjacking (an
+ * attacker framing the parent gallery to harvest clicks), MIME sniffing (a
+ * malicious upload being reinterpreted as script), and referrer leakage (a
+ * child's gallery URL travelling to third parties in the Referer header —
+ * which matters here because that URL is currently the only thing protecting
+ * the gallery).
+ */
+app.use((_req, res, next) => {
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
+
+/**
+ * Serve ONLY derived, watermarked variants over HTTP — never originals.
+ *
+ * `express.static(STORAGE_ROOT)` served the entire storage tree, including
+ * `originals/`: full-resolution, unwatermarked, unpaid-for photographs of
+ * children, downloadable by anyone who learned a filename. The random 128-bit
+ * filename made guessing impractical, but that is precisely the "unguessable
+ * URL as security" model §6.6 rejects — a URL leaks through browser history,
+ * shared links, and Referer headers, and once leaked it is permanent because
+ * nothing checks who is asking.
+ *
+ * Originals now have no HTTP route at all. They are reachable only through
+ * code, which is where the paid-download grant check belongs when digital
+ * delivery is wired up.
+ */
+app.use("/storage/variants", express.static(STORAGE_ROOT + "/variants", {
+  // Content-addressed keys never change meaning, so they cache hard.
+  maxAge: "7d",
+  immutable: true,
+}));
 
 const PUBLIC_DIR = new URL("../../public", import.meta.url).pathname;
 app.get("/import.html", requireStaffAuth, (_req, res) => res.sendFile(PUBLIC_DIR + "/import.html"));
@@ -314,7 +352,17 @@ app.post("/api/claim/redeem", async (req, res) => {
 });
 
 // ── Parent gallery ────────────────────────────────────────────────────────────
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 app.get("/g/:childId", async (req, res) => {
+  // A malformed id reached Postgres as a uuid cast and raised, surfacing as a
+  // 500 "Internal Server Error" to anyone who mistyped a link. That is both a
+  // bad experience and a small information leak (a 500 says "your input broke
+  // something"; a 404 says nothing). Validate the shape first.
+  if (!UUID_RE.test(req.params.childId)) {
+    return res.status(404).send(page({ title: "Not found", nav: NAV, body: `<div class="empty">No such gallery.</div>` }));
+  }
+
   const child = await pool.query(
     `select c.id, c.first_name, c.last_name, c.school_id, cl.name as class_name, g.name as grade_name,
             s.display_name, s.name as school_name
@@ -645,13 +693,30 @@ app.get("/admin", async (req, res) => {
   );
   const n = counts.rows[0];
 
-  const children = await pool.query(
-    `select c.id, c.first_name, c.last_name,
-            (select count(*) from gallery_item gi where gi.child_id = c.id) as photo_count,
-            exists(select 1 from claim_code cc where cc.child_id = c.id and cc.redeemed_at is not null) as claimed
-       from child c where c.school_id = $1 order by c.last_name, c.first_name`,
-    [selected.id],
-  );
+  // Search across children by name. Uses app.immutable_unaccent so that a
+  // parent or staff member typing "Zane" finds "Zané" — the exact case §13
+  // built the unaccent index for. Also matches on the full name, so "Botha"
+  // and "Noah Botha" both work.
+  const q = ((req.query.q as string) || "").trim();
+  const children = q
+    ? await pool.query(
+        `select c.id, c.first_name, c.last_name,
+                (select count(*) from gallery_item gi where gi.child_id = c.id) as photo_count,
+                exists(select 1 from claim_code cc where cc.child_id = c.id and cc.redeemed_at is not null) as claimed
+           from child c
+          where c.school_id = $1
+            and app.immutable_unaccent(c.first_name || ' ' || c.last_name)
+                ilike '%' || app.immutable_unaccent($2) || '%'
+          order by c.last_name, c.first_name`,
+        [selected.id, q],
+      )
+    : await pool.query(
+        `select c.id, c.first_name, c.last_name,
+                (select count(*) from gallery_item gi where gi.child_id = c.id) as photo_count,
+                exists(select 1 from claim_code cc where cc.child_id = c.id and cc.redeemed_at is not null) as claimed
+           from child c where c.school_id = $1 order by c.last_name, c.first_name`,
+        [selected.id],
+      );
 
   const products = await pool.query(
     `select id, sku, name_i18n->>'en' as name, active from product where studio_id = $1 order by sku`,
@@ -782,9 +847,20 @@ app.get("/admin", async (req, res) => {
       }
 
       <div class="sectlabel"><span>Children</span></div>
+      <form method="get" action="/admin" style="display:flex;gap:6px;margin-bottom:10px;max-width:420px">
+        <input type="hidden" name="school" value="${selected.id}">
+        <input name="q" value="${escapeHtml(q)}" placeholder="Search by name…"
+               style="flex:1;padding:9px;border:1px solid var(--rule);border-radius:2px">
+        <button type="submit" class="btn" style="width:auto;padding:9px 16px">Search</button>
+        ${q ? `<a href="/admin?school=${selected.id}" class="navlink" style="align-self:center">Clear</a>` : ""}
+      </form>
+      ${q ? `<div class="mono" style="font-size:11px;color:var(--silver);margin-bottom:8px">
+              ${children.rowCount} result(s) for "${escapeHtml(q)}"</div>` : ""}
       ${
         children.rowCount === 0
-          ? `<div class="empty">No children at this school yet.</div>`
+          ? q
+            ? `<div class="empty">No children match "${escapeHtml(q)}".</div>`
+            : `<div class="empty">No children at this school yet.</div>`
           : `<table><thead><tr><th>Name</th><th>Photographs</th><th>Gallery link</th><th>Claim cards</th><th>Claimed</th></tr></thead><tbody>
           ${children.rows
             .map(
