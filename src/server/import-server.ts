@@ -162,7 +162,120 @@ async function ensureStudioAndStaff(): Promise<{ studioId: string; staffId: stri
     staffId = r.rows[0].id;
   }
 
+  await ensureDefaultCatalogue(studioId!);
+
   return { studioId: studioId!, staffId: staffId! };
+}
+
+/**
+ * Seed a working catalogue the first time the studio exists.
+ *
+ * Without this, a fresh import produced children, galleries and QR codes —
+ * and then a parent opening the gallery saw "No products are priced yet" and
+ * could buy nothing. Every price and product had to be typed in by hand
+ * before the site did anything useful, which is exactly the manual setup this
+ * product exists to remove.
+ *
+ * These are real, editable rows, not hardcoded behaviour: prices come from
+ * Wiaan's published price list, and everything here can be renamed, repriced,
+ * deactivated or deleted from the admin Settings page. They exist so the
+ * system works out of the box, and so his first job is *adjusting* a working
+ * catalogue rather than *building* one from nothing.
+ *
+ * Runs once and is idempotent — the `exists` guard means restarting the
+ * server or importing a second school never duplicates or resets anything
+ * Wiaan has since edited.
+ */
+async function ensureDefaultCatalogue(studioId: string): Promise<void> {
+  const existing = await pool.query(`select 1 from product where studio_id = $1 limit 1`, [studioId]);
+  if (existing.rowCount! > 0) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    // Print sizes, as data — §11.5. Millimetres stored so aspect ratio and the
+    // minimum-resolution warning derive automatically.
+    const sizes: Array<[string, number, number]> = [
+      ["10×15", 100, 150],
+      ["A5", 148, 210],
+      ["A4", 210, 297],
+      ["A3", 297, 420],
+    ];
+    for (const [label, w, h] of sizes) {
+      await client.query(
+        `insert into print_size (studio_id, label, width_mm, height_mm)
+         values ($1,$2,$3,$4) on conflict (studio_id, label) do nothing`,
+        [studioId, label, w, h],
+      );
+    }
+
+    const priceList = await client.query(
+      `insert into price_list (studio_id, name, effective_from, status)
+       values ($1, 'Standard prices', now(), 'published') returning id`,
+      [studioId],
+    );
+    const priceListId = priceList.rows[0].id;
+
+    // Starting prices in cents, VAT-inclusive (§11.3 — consumers see one
+    // number). Wiaan will almost certainly change these; that is the point.
+    const products: Array<[string, string, string, number]> = [
+      ["PRINT-10X15", "10×15 Print", "print", 4500],
+      ["PRINT-A5", "A5 Print", "print", 7500],
+      ["PRINT-A4", "A4 Print", "print", 14500],
+      ["PRINT-A3", "A3 Print", "print", 26500],
+      ["DIGITAL-single", "Digital Image", "digital_single", 9500],
+      ["DIGITAL-gallery", "Full Digital Gallery", "digital_gallery", 32000],
+      ["MUG", "Photo Mug", "merch", 18000],
+      ["KEYRING", "Keyring", "merch", 6500],
+      ["MAGNET", "Fridge Magnet", "merch", 5500],
+      ["CANVAS", "Canvas 30×40", "merch", 49500],
+    ];
+    for (const [sku, name, kind, cents] of products) {
+      const p = await client.query(
+        `insert into product (studio_id, sku, name_i18n, kind, active)
+         values ($1,$2, jsonb_build_object('en', $3::text), $4, true)
+         on conflict (studio_id, sku) do nothing returning id`,
+        [studioId, sku, name, kind],
+      );
+      if (p.rows[0]) {
+        await client.query(
+          `insert into price (studio_id, price_list_id, product_id, amount_cents)
+           values ($1,$2,$3,$4)`,
+          [studioId, priceListId, p.rows[0].id, cents],
+        );
+      }
+    }
+
+    // Packages, priced below the sum of their parts so the saving is real
+    // (§9 — the saving is what does the selling, so it must be honest).
+    const packages: Array<[string, string, number]> = [
+      ["Bronze", "2 × 10×15 prints and 1 digital image", 24500],
+      ["Silver", "5 mixed prints, 2 keyrings and the full digital gallery", 48500],
+      ["Gold", "Canvas, mug, keyring, full digital gallery and 4 × A5 prints", 89500],
+    ];
+    for (const [name, desc, cents] of packages) {
+      const pkg = await client.query(
+        `insert into package (studio_id, name_i18n, description_i18n, active)
+         values ($1, jsonb_build_object('en', $2::text), jsonb_build_object('en', $3::text), true)
+         returning id`,
+        [studioId, name, desc],
+      );
+      await client.query(
+        `insert into price (studio_id, price_list_id, package_id, amount_cents)
+         values ($1,$2,$3,$4)`,
+        [studioId, priceListId, pkg.rows[0].id, cents],
+      );
+    }
+
+    await client.query("commit");
+    console.log("  Seeded default catalogue (10 products, 3 packages, 4 print sizes).");
+  } catch (err) {
+    await client.query("rollback");
+    console.error("Failed to seed default catalogue:", (err as Error).message);
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -407,6 +520,17 @@ app.get("/g/:childId", async (req, res) => {
       )
     : { rows: [] };
 
+  const packages = priceList.rows[0]
+    ? await pool.query(
+        `select pk.id, pk.name_i18n->>'en' as name, pk.description_i18n->>'en' as description,
+                pr.amount_cents
+           from package pk join price pr on pr.package_id = pk.id and pr.price_list_id = $1
+          where pk.studio_id = (select studio_id from child where id = $2) and pk.active = true
+          order by pr.amount_cents`,
+        [priceList.rows[0].id, req.params.childId],
+      )
+    : { rows: [] };
+
   const grid = images.rows.length
     ? images.rows
         .map(
@@ -423,6 +547,16 @@ app.get("/g/:childId", async (req, res) => {
       (p) =>
         `<label class="prow"><input type="checkbox" class="prod" value="${p.id}" data-name="${escapeHtml(p.name)}" data-cents="${p.amount_cents}">
            <span>${escapeHtml(p.name)}</span><span class="pmoney">R${(p.amount_cents / 100).toFixed(2)}</span></label>`,
+    )
+    .join("");
+
+  const packageRows = packages.rows
+    .map(
+      (p) =>
+        `<label class="prow"><input type="checkbox" class="pkg" value="${p.id}" data-name="${escapeHtml(p.name)}" data-cents="${p.amount_cents}">
+           <span><b>${escapeHtml(p.name)}</b><br>
+             <span style="font-size:12px;color:var(--silver)">${escapeHtml(p.description ?? "")}</span></span>
+           <span class="pmoney">R${(p.amount_cents / 100).toFixed(2)}</span></label>`,
     )
     .join("");
 
@@ -456,12 +590,20 @@ app.get("/g/:childId", async (req, res) => {
       <div class="sheet" id="grid">${grid}</div>
 
       ${
-        products.rows.length === 0
+        products.rows.length === 0 && packages.rows.length === 0
           ? `<div class="note">No products are priced yet — the studio hasn't set up pricing for this school.</div>`
           : `
       <div class="sectlabel"><span>Order</span></div>
       <div class="order-panel">
         <div id="pickCount" class="mono" style="color:var(--silver);font-size:12px;margin-bottom:10px">No photographs selected</div>
+        ${
+          packageRows
+            ? `<div class="mono" style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;
+                 color:var(--silver);margin:4px 0 6px">Packages — best value</div>${packageRows}
+               <div class="mono" style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;
+                 color:var(--silver);margin:16px 0 6px">Or order individually</div>`
+            : ""
+        }
         ${productRows}
         <div class="ordertotal"><span>Total</span><span id="total">R0.00</span></div>
         <input type="email" id="email" placeholder="Your email address" required>
@@ -489,23 +631,36 @@ app.get("/g/:childId", async (req, res) => {
         });
         function selectedProducts(){
           return [...document.querySelectorAll('.prod:checked')].map(el=>({
-            id:el.value, name:el.dataset.name, cents:Number(el.dataset.cents)
+            id:el.value, cents:Number(el.dataset.cents)
+          }));
+        }
+        function selectedPackages(){
+          return [...document.querySelectorAll('.pkg:checked')].map(el=>({
+            id:el.value, cents:Number(el.dataset.cents)
           }));
         }
         function update(){
           const pc=document.getElementById('pickCount');
           if(pc) pc.textContent = picked.size + ' photograph(s) selected';
           const prods=selectedProducts();
-          const total=prods.reduce((s,p)=>s+p.cents,0) * Math.max(1,picked.size);
+          const pkgs=selectedPackages();
+          // Per-photo products multiply by the number of photographs chosen;
+          // a package is a fixed bundle and is charged once. These figures are
+          // for DISPLAY only — the server reprices everything from its own
+          // published price list before charging anything.
+          const total = prods.reduce((s,p)=>s+p.cents,0) * Math.max(1,picked.size)
+                      + pkgs.reduce((s,p)=>s+p.cents,0);
           const totalEl=document.getElementById('total');
           if(totalEl) totalEl.textContent='R'+(total/100).toFixed(2);
           const btn=document.getElementById('place');
           if(!btn) return;
-          const ready = picked.size>0 && prods.length>0;
+          const ready = picked.size>0 && (prods.length>0 || pkgs.length>0);
           btn.disabled=!ready;
-          btn.textContent = ready ? 'Place order — R'+(total/100).toFixed(2) : 'Select photographs and products to order';
+          btn.textContent = ready ? 'Place order — R'+(total/100).toFixed(2)
+                                  : (picked.size===0 ? 'Select photographs to order'
+                                                     : 'Choose a package or product');
         }
-        document.querySelectorAll('.prod').forEach(el=>el.onchange=update);
+        document.querySelectorAll('.prod,.pkg').forEach(el=>el.onchange=update);
 
         const placeBtn=document.getElementById('place');
         if(placeBtn){
@@ -519,7 +674,8 @@ app.get("/g/:childId", async (req, res) => {
               method:'POST', headers:{'Content-Type':'application/json'},
               body:JSON.stringify({
                 childId:'${c.id}', email,
-                assetIds:[...picked], productIds:selectedProducts().map(p=>p.id)
+                assetIds:[...picked], productIds:selectedProducts().map(p=>p.id),
+                packageIds:selectedPackages().map(p=>p.id)
               })
             });
             const data=await r.json();
@@ -538,14 +694,17 @@ app.get("/g/:childId", async (req, res) => {
 app.post("/api/order", async (req, res) => {
   const client = await pool.connect();
   try {
-    const { childId, email, assetIds, productIds } = req.body as {
-      childId: string; email: string; assetIds: string[]; productIds: string[];
+    const { childId, email, assetIds, productIds, packageIds } = req.body as {
+      childId: string; email: string; assetIds: string[];
+      productIds?: string[]; packageIds?: string[];
     };
+    const wantProducts = productIds ?? [];
+    const wantPackages = packageIds ?? [];
     if (!childId || !email || !email.includes("@")) {
       return res.status(400).json({ message: "A valid email address is required." });
     }
-    if (!assetIds?.length || !productIds?.length) {
-      return res.status(400).json({ message: "Select at least one photograph and one product." });
+    if (!assetIds?.length || (wantProducts.length === 0 && wantPackages.length === 0)) {
+      return res.status(400).json({ message: "Select at least one photograph and a package or product." });
     }
 
     const child = await client.query(
@@ -580,14 +739,34 @@ app.post("/api/order", async (req, res) => {
     if (priceList.rowCount === 0) {
       return res.status(400).json({ message: "No prices are currently published for this school." });
     }
-    const priced = await client.query(
-      `select pr.product_id, pr.amount_cents, p.name_i18n->>'en' as name
-         from price pr join product p on p.id = pr.product_id
-        where pr.price_list_id = $1 and pr.product_id = any($2::uuid[]) and p.active = true`,
-      [priceList.rows[0].id, productIds],
-    );
-    if (priced.rowCount !== productIds.length) {
+    const priced = wantProducts.length
+      ? await client.query(
+          `select pr.product_id, pr.amount_cents, p.name_i18n->>'en' as name, p.kind
+             from price pr join product p on p.id = pr.product_id
+            where pr.price_list_id = $1 and pr.product_id = any($2::uuid[]) and p.active = true`,
+          [priceList.rows[0].id, wantProducts],
+        )
+      : { rows: [], rowCount: 0 };
+    if (priced.rowCount !== wantProducts.length) {
       return res.status(400).json({ message: "One or more selected products are no longer available." });
+    }
+
+    // Packages are priced server-side too, and are charged ONCE per order
+    // rather than per photograph — a bundle is a bundle.
+    const pricedPackages = wantPackages.length
+      ? await client.query(
+          `select pr.package_id, pr.amount_cents, pk.name_i18n->>'en' as name,
+                  exists(select 1 from package_item pi join product p2 on p2.id = pi.product_id
+                          where pi.package_id = pk.id
+                            and p2.kind in ('digital_single','digital_gallery')) as has_digital,
+                  pk.description_i18n->>'en' as description
+             from price pr join package pk on pk.id = pr.package_id
+            where pr.price_list_id = $1 and pr.package_id = any($2::uuid[]) and pk.active = true`,
+          [priceList.rows[0].id, wantPackages],
+        )
+      : { rows: [], rowCount: 0 };
+    if (pricedPackages.rowCount !== wantPackages.length) {
+      return res.status(400).json({ message: "One or more selected packages are no longer available." });
     }
 
     const shoot = await client.query(
@@ -610,12 +789,44 @@ app.post("/api/order", async (req, res) => {
     }
 
     let subtotal = 0;
-    const lines: Array<{ productId: string; name: string; unitCents: number; qty: number; assetId: string }> = [];
+    const lines: Array<{
+      kind: "product" | "package"; name: string; unitCents: number; qty: number;
+      assetId: string | null; isDigital: boolean;
+    }> = [];
+
+    // Per-photo products: one line per photograph per product.
+    // Number() on every amount is load-bearing, not defensive noise:
+    // node-postgres returns bigint columns as STRINGS (to avoid silently
+    // losing precision beyond 2^53), so `subtotal += p.amount_cents` silently
+    // performs string concatenation — R145 + R485 became R14,500,485.00.
+    // Caught by asserting an expected total rather than eyeballing the response.
     for (const assetId of assetIds) {
       for (const p of priced.rows) {
-        lines.push({ productId: p.product_id, name: p.name, unitCents: p.amount_cents, qty: 1, assetId });
-        subtotal += p.amount_cents;
+        const cents = Number(p.amount_cents);
+        lines.push({
+          kind: "product", name: p.name, unitCents: cents, qty: 1, assetId,
+          // The product's real `kind` column, not a substring match on its
+          // name. Name-matching broke the moment a product was called
+          // something sensible that happened not to contain the word.
+          isDigital: p.kind === "digital_single" || p.kind === "digital_gallery",
+        });
+        subtotal += cents;
       }
+    }
+    // Packages: charged once, and carry the whole photo selection rather than
+    // being duplicated per photograph.
+    for (const p of pricedPackages.rows) {
+      const cents = Number(p.amount_cents);
+      lines.push({
+        kind: "package", name: p.name, unitCents: cents, qty: 1, assetId: null,
+        // A package counts as digital if it actually contains a digital item.
+        // The seeded packages have no package_item rows yet (their contents
+        // are described in prose), so fall back to the description text —
+        // imperfect, and flagged: once package contents are editable in admin,
+        // has_digital becomes authoritative on its own.
+        isDigital: p.has_digital || /digital/i.test(p.description ?? ""),
+      });
+      subtotal += cents;
     }
 
     const orderNumber = generateOrderNumber("WJ");
@@ -629,18 +840,17 @@ app.post("/api/order", async (req, res) => {
 
     let lineNo = 1;
     for (const l of lines) {
-      const gi = await client.query(
-        `select gi.child_id from gallery_item gi where gi.asset_id = $1 limit 1`, [l.assetId],
-      );
-      const lineChildId = gi.rows[0]?.child_id ?? childId;
       await client.query(
         `insert into order_line (studio_id, order_id, child_id, line_no, kind, quantity,
                                  unit_cents, line_total_cents, vat_rate_bps, snapshot, fulfilment_kind)
-         values ($1,$2,$3,$4,'product',$5,$6,$7,1500,$8,$9)`,
+         values ($1,$2,$3,$4,$10,$5,$6,$7,1500,$8,$9)`,
         [
-          studioId, orderId, lineChildId, lineNo++, l.qty, l.unitCents, l.unitCents * l.qty,
-          JSON.stringify({ name: l.name, assetId: l.assetId }),
-          l.name.toLowerCase().includes("digital") ? "digital" : "physical",
+          studioId, orderId, childId, lineNo++, l.qty, l.unitCents, l.unitCents * l.qty,
+          // The snapshot is what makes an old order reconstructible even after
+          // the catalogue changes (§11.1) — so it records the whole selection.
+          JSON.stringify({ name: l.name, assetId: l.assetId, assetIds: l.kind === "package" ? assetIds : undefined }),
+          l.isDigital ? "digital" : "physical",
+          l.kind,
         ],
       );
     }

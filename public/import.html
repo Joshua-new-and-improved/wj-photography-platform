@@ -62,16 +62,21 @@ h1{font-size:20px;margin-bottom:4px}
 </div>
 
 <div id="codesBox" style="display:none" class="codes">
-  <h3>Claim codes issued</h3>
+  <h3>Done — claim codes issued</h3>
   <div id="codesList"></div>
-  <p class="lead" style="margin-top:10px">Each code is one-time and hashed with Argon2id in the
-    database — this list is the only place the plaintext exists. <a id="galleryLink" href="#">Open
-    the gallery this generated →</a></p>
+  <p class="lead" style="margin-top:12px">Each code is one-time and hashed in the database — this
+    list is the only place the plaintext exists, so print the cards now.</p>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+    <a id="cardsLink" href="#" class="btn" style="display:inline-block;text-decoration:none">
+      Print QR cards for this school →</a>
+    <a id="adminLink" href="/admin" class="btn" style="display:inline-block;text-decoration:none;
+       background:none;color:var(--graphite);border:1px solid var(--graphite)">Open the studio dashboard</a>
+  </div>
 </div>
 
 <script>
 const $=id=>document.getElementById(id);
-let batchId=null, staged=[], lastName='';
+let batchId=null, staged=[], lastName='', schoolId=null;
 
 function log(msg){ $('status').textContent += '\n'+msg; $('status').scrollTop=1e9; }
 
@@ -119,6 +124,7 @@ async function upload(files){
 
   batchId=data.batchId;
   staged=data.staged;
+  schoolId=data.schoolId;
   log('School detected: '+data.schoolName);
   log('Processed '+staged.length+' of '+files.length+' file(s) successfully.');
   if(staged.length<files.length) log((files.length-staged.length)+' failed — check the server log.');
@@ -188,6 +194,13 @@ $('commitBtn').onclick=async()=>{
 
   $('codesBox').style.display='block';
   $('codesList').innerHTML=data.claimCodes.map(c=>`<div>${c.child} — <b>${c.grouped}</b></div>`).join('');
+  // Hand the photographer straight to the printable cards — the whole point
+  // is that the next step is obvious, not something to go hunting for.
+  if(schoolId){
+    $('cardsLink').href='/admin/cards/'+schoolId;
+    $('adminLink').href='/admin?school='+schoolId;
+  }
+  $('codesBox').scrollIntoView({behavior:'smooth'});
 };
 </script>
 </body>
