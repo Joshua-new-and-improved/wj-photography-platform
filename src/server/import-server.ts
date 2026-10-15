@@ -10,8 +10,17 @@ import { segmentBySlates, reviewSummary, type Frame } from "../lib/import/segmen
 import { deriveVariants } from "../lib/media/derive.js";
 import { putObject, publicUrl, randomKey } from "../lib/storage/local.js";
 import { issueClaimCode, redeemClaimCode, completeClaim } from "../lib/claim.js";
-import { generateSessionToken, hashToken, generateOrderNumber } from "../lib/ids.js";
+import { generateOrderNumber, normaliseCode } from "../lib/ids.js";
 import { page, escapeHtml } from "./views.js";
+import { getObject } from "../lib/storage/local.js";
+import { migrateOnBoot } from "./migrate.js";
+import {
+  readParentSession, sessionCanViewChild, createAnonymousGuardian, grantChildToBrowser,
+  probeRlsRole, rlsEnforcedForParents, asGuardianRls, type ParentSession,
+} from "./parent-auth.js";
+import {
+  WEBHOOK_PATH, handleYocoWebhook, startCheckout, settleOrder, saveYocoKey, yocoStatus, ensureYocoWebhook,
+} from "./payments.js";
 
 /**
  * A real, running server — not another prototype.
@@ -68,12 +77,33 @@ function requireStaffAuth(req: express.Request, res: express.Response, next: exp
   res.status(401).send("Staff sign-in required.");
 }
 
+// Railway terminates TLS at one proxy hop. Without this, req.ip is the
+// proxy's address for every parent — so five wrong codes from ANYONE tripped
+// the claim rate limit for EVERY parent for 15 minutes — and req.secure is
+// false, so the session cookie could not be marked Secure.
+app.set("trust proxy", 1);
+
+// The Yoco webhook must see the exact bytes Yoco signed, so it is mounted
+// with a raw body parser BEFORE express.json() gets a chance to consume it.
+app.post(WEBHOOK_PATH, express.raw({ type: "*/*", limit: "1mb" }), async (req, res) => {
+  const raw = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : "";
+  const status = await handleYocoWebhook(pool, req.headers, raw, req.ip);
+  res.status(status).json({ ok: status < 300 });
+});
+
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 app.use((req, _res, next) => {
   const raw = req.headers.cookie ?? "";
   (req as any).cookies = Object.fromEntries(
-    raw.split(";").map((p) => p.trim().split("=")).filter((p) => p[0]),
+    raw.split(";").map((p) => {
+      const t = p.trim();
+      const i = t.indexOf("=");
+      if (i < 0) return [t, ""];
+      let v = t.slice(i + 1);
+      try { v = decodeURIComponent(v); } catch { /* keep raw */ }
+      return [t.slice(0, i), v];
+    }).filter((p) => p[0]),
   );
   next();
 });
@@ -344,13 +374,15 @@ async function findOrCreateShoot(studioId: string, schoolId: string): Promise<st
 // ============================================================================
 
 const NAV = `<a class="navlink" href="/admin">Studio</a><a class="navlink" href="/import.html">Import</a>`;
+// Parents never see links into the staff area.
+const PARENT_NAV = ``;
 
 // ── Home: claim code entry ───────────────────────────────────────────────────
 app.get("/", (_req, res) => {
   res.send(
     page({
       title: "Find your child's photographs",
-      nav: NAV,
+      nav: PARENT_NAV,
       body: `
       <div class="claim">
         <h1>Find your child's<br>photographs</h1>
@@ -373,6 +405,10 @@ app.get("/", (_req, res) => {
             if(el.value.length===el.maxLength && arr[i+1]) $(arr[i+1]).focus();
           };
         });
+        // The QR code on the printed card opens /?code=XXXX-XXX-XXX: fill the
+        // boxes and go straight through, so a scan is one tap, not a retype.
+        const fromQr=(new URLSearchParams(location.search).get('code')||'')
+          .toUpperCase().replace(/[^0-9A-Z]/g,'');
         $('go').onclick=async()=>{
           const code = $('c1').value + $('c2').value + $('c3').value;
           $('go').disabled = true; $('err').textContent='';
@@ -388,6 +424,11 @@ app.get("/", (_req, res) => {
             $('go').disabled = false;
           }
         };
+        if(fromQr.length===10){
+          $('c1').value=fromQr.slice(0,4); $('c2').value=fromQr.slice(4,7); $('c3').value=fromQr.slice(7);
+          history.replaceState(null,'','/');
+          $('go').click();
+        }
       </script>`,
     }),
   );
@@ -401,62 +442,83 @@ app.post("/api/claim/redeem", async (req, res) => {
   try {
     const { code } = req.body as { code: string };
     const { studioId } = await ensureStudioAndStaff();
+    const ip = req.ip ?? "0.0.0.0";
+
+    await client.query("begin");
     await client.query("select set_config('app.actor_kind', 'system', true)");
 
-    const shoots = await pool.query(
-      `select id from shoot where studio_id = $1 and status = 'open'`,
-      [studioId],
+    // Only try shoots that actually hold a code with this hint. Trying every
+    // open shoot logged a "not_found" attempt for each school the code was
+    // NOT from — so with six schools open, one parent's valid code counted
+    // as five failures and locked out everyone on that IP (school wifi) for
+    // 15 minutes. With no candidate at all, one attempt is still made so the
+    // miss is recorded and rate-limited exactly once.
+    const hint = normaliseCode(code ?? "").slice(-3);
+    let shoots = await client.query(
+      `select distinct sh.id from shoot sh join claim_code cc on cc.shoot_id = sh.id
+        where sh.studio_id = $1 and sh.status = 'open' and cc.code_hint = $2`,
+      [studioId, hint],
     );
+    if (shoots.rowCount === 0) {
+      shoots = await client.query(
+        `select id from shoot where studio_id = $1 and status = 'open' limit 1`, [studioId],
+      );
+    }
 
     let result: Awaited<ReturnType<typeof redeemClaimCode>> | null = null;
     for (const s of shoots.rows) {
-      const attempt = await redeemClaimCode(client, {
-        submitted: code ?? "",
-        shootId: s.id,
-        ip: req.ip ?? "0.0.0.0",
-      });
-      if (attempt.outcome === "success") { result = attempt; break; }
-      // Keep the most informative non-success outcome to report, preferring
-      // "already redeemed" over a plain "not found" since it is the more
-      // actionable signal for the parent (§6.2).
+      const attempt = await redeemClaimCode(client, { submitted: code ?? "", shootId: s.id, ip });
+      if (attempt.outcome === "success" || attempt.outcome === "already_redeemed") { result = attempt; break; }
+      // Keep the most informative non-success outcome to report.
       if (!result || attempt.outcome !== "not_found") result = attempt;
     }
 
-    if (!result || result.outcome !== "success") {
+    if (!result || (result.outcome !== "success" && result.outcome !== "already_redeemed")) {
+      // Attempts are logged inside this transaction; commit so the rate
+      // limit actually counts them.
+      await client.query("commit");
       return res.status(400).json({ message: result?.message ?? "That code was not recognised." });
     }
 
-    let guardian = await client.query(`select id from guardian where email = $1`, ["testparent@example.com"]);
-    let guardianId = guardian.rows[0]?.id as string | undefined;
-    if (!guardianId) {
-      const r = await client.query(
-        `insert into guardian (email, full_name, verified_at) values ($1,$2,now()) returning id`,
-        ["testparent@example.com", "Test Parent"],
+    // Who is this browser? Reuse its guardian if it already has a session
+    // (a parent entering a second child's card), otherwise a fresh guardian.
+    // Never look a guardian up by anything the request merely asserts.
+    const existing = await readParentSession(client, req);
+    const guardianId = existing?.guardianId ?? (await createAnonymousGuardian(client));
+
+    if (result.outcome === "success") {
+      await completeClaim(client, {
+        studioId,
+        claimCodeId: result.claimCodeId!,
+        childId: result.childId!,
+        shootId: result.shootId!,
+        guardianId,
+        ip,
+        consentWordingVersion: "v1.0",
+        locale: "en",
+      });
+    } else {
+      // The card was used before (other parent, new phone). Holding the card
+      // is the credential, so bind this browser's guardian too — the code
+      // itself stays burned, and a revoked or expired code never gets here.
+      await client.query(
+        `insert into guardian_child (studio_id, guardian_id, child_id, relationship, bound_via, bound_ip)
+         values ($1, $2, $3, 'parent', 'claim_code', $4)
+         on conflict (guardian_id, child_id) do update set revoked_at = null`,
+        [studioId, guardianId, result.childId, ip],
       );
-      guardianId = r.rows[0].id;
+      await client.query(
+        `insert into consent_record (studio_id, child_id, guardian_id, shoot_id, scope, wording_version, locale, evidence)
+         values ($1, $2, $3, $4, 'service', 'v1.0', 'en', $5) on conflict do nothing`,
+        [studioId, result.childId, guardianId, result.shootId, JSON.stringify({ ip, at: new Date().toISOString(), via: "re-entry" })],
+      );
     }
 
-    await completeClaim(client, {
-      studioId,
-      claimCodeId: result.claimCodeId!,
-      childId: result.childId!,
-      shootId: result.shootId!,
-      guardianId: guardianId!,
-      ip: req.ip ?? "0.0.0.0",
-      consentWordingVersion: "v1.0",
-      locale: "en",
-    });
-
-    const token = generateSessionToken();
-    await client.query(
-      `insert into guardian_session (guardian_id, token_hash, expires_at)
-       values ($1,$2, now() + interval '24 hours')`,
-      [guardianId, hashToken(token)],
-    );
-    res.cookie("session", token, { httpOnly: true, sameSite: "lax" });
-
+    await grantChildToBrowser(client, req, res, existing, guardianId, result.childId!);
+    await client.query("commit");
     res.json({ childId: result.childId });
   } catch (err) {
+    await client.query("rollback").catch(() => {});
     console.error(err);
     res.status(500).json({ message: "Something went wrong on our end." });
   } finally {
@@ -467,69 +529,119 @@ app.post("/api/claim/redeem", async (req, res) => {
 // ── Parent gallery ────────────────────────────────────────────────────────────
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+const NOT_FOUND_PAGE = () =>
+  page({ title: "Not found", nav: PARENT_NAV, body: `<div class="empty">No such gallery.</div>` });
+
+/**
+ * A browser that has not entered this child's card gets the same page as a
+ * gallery that does not exist — no hint that the id is real — plus a way in.
+ */
+const LOCKED_PAGE = () =>
+  page({
+    title: "Enter your code",
+    nav: PARENT_NAV,
+    body: `<div class="claim"><h1>Enter your code</h1>
+      <p>To see these photographs, enter the code from your child's card on this device.</p>
+      <a class="btn" href="/" style="display:inline-block;text-align:center">Enter code</a></div>`,
+  });
+
 app.get("/g/:childId", async (req, res) => {
   // A malformed id reached Postgres as a uuid cast and raised, surfacing as a
-  // 500 "Internal Server Error" to anyone who mistyped a link. That is both a
-  // bad experience and a small information leak (a 500 says "your input broke
-  // something"; a 404 says nothing). Validate the shape first.
-  if (!UUID_RE.test(req.params.childId)) {
-    return res.status(404).send(page({ title: "Not found", nav: NAV, body: `<div class="empty">No such gallery.</div>` }));
+  // 500. Validate the shape first.
+  if (!UUID_RE.test(req.params.childId)) return res.status(404).send(NOT_FOUND_PAGE());
+  const session = await readParentSession(pool, req);
+  if (!(await sessionCanViewChild(pool, session, req.params.childId))) {
+    return res.status(404).send(LOCKED_PAGE());
   }
+  await renderGallery(req, res, req.params.childId, session);
+});
 
-  const child = await pool.query(
-    `select c.id, c.first_name, c.last_name, c.school_id, cl.name as class_name, g.name as grade_name,
-            s.display_name, s.name as school_name
-       from child c
-       left join enrolment e on e.child_id = c.id
-       left join class_group cl on cl.id = e.class_group_id
-       left join grade g on g.id = cl.grade_id
-       join school s on s.id = c.school_id
-      where c.id = $1`,
-    [req.params.childId],
-  );
-  if (child.rowCount === 0) {
-    return res.status(404).send(page({ title: "Not found", nav: NAV, body: `<div class="empty">No such gallery.</div>` }));
-  }
-  const c = child.rows[0];
+// Staff preview of any child's gallery: behind the /admin Basic-auth gate,
+// read-only, no ordering.
+app.get("/admin/preview/:childId", async (req, res) => {
+  if (!UUID_RE.test(req.params.childId)) return res.status(404).send(NOT_FOUND_PAGE());
+  await renderGallery(req, res, req.params.childId, null);
+});
+
+async function renderGallery(req: express.Request, res: express.Response, childId: string, session: ParentSession | null) {
+  const isParent = session !== null;
+
+  // Parent reads run as the guardian under the database's row-level policies
+  // (asGuardianRls), so even a bug in the check above cannot widen what comes
+  // back. Staff preview reads directly.
+  const load = async (db: { query: typeof pool.query }) => {
+    const child = await db.query(
+      `select c.id, c.first_name, c.last_name, c.school_id, c.studio_id, s.display_name, s.name as school_name
+         from child c join school s on s.id = c.school_id
+        where c.id = $1`,
+      [childId],
+    );
+    if (child.rowCount === 0) return null;
+    const images = await db.query(
+      `select a.id as asset_id, av.storage_key
+         from gallery_item gi
+         join asset a on a.id = gi.asset_id
+         join asset_variant av on av.asset_id = a.id and av.kind = 'preview'
+        where gi.child_id = $1
+        order by gi.sort_order`,
+      [childId],
+    );
+    // Real prices, from whatever price list is actually published.
+    const priceList = await db.query(
+      `select id from price_list where studio_id = $1 and status = 'published' order by effective_from desc limit 1`,
+      [child.rows[0].studio_id],
+    );
+    const products = priceList.rows[0]
+      ? await db.query(
+          `select p.id, p.name_i18n->>'en' as name, pr.amount_cents
+             from product p join price pr on pr.product_id = p.id and pr.price_list_id = $1
+            where p.studio_id = $2 and p.active = true
+            order by pr.amount_cents`,
+          [priceList.rows[0].id, child.rows[0].studio_id],
+        )
+      : { rows: [] as any[] };
+    const packages = priceList.rows[0]
+      ? await db.query(
+          `select pk.id, pk.name_i18n->>'en' as name, pk.description_i18n->>'en' as description, pr.amount_cents
+             from package pk join price pr on pr.package_id = pk.id and pr.price_list_id = $1
+            where pk.studio_id = $2 and pk.active = true
+            order by pr.amount_cents`,
+          [priceList.rows[0].id, child.rows[0].studio_id],
+        )
+      : { rows: [] as any[] };
+    const orders = isParent
+      ? await db.query(
+          `select distinct o.order_number, o.total_cents, o.payment_status, o.placed_at
+             from "order" o join order_line ol on ol.order_id = o.id
+            where o.guardian_id = $1 and ol.child_id = $2
+            order by o.placed_at desc`,
+          [session!.guardianId, childId],
+        )
+      : { rows: [] as any[] };
+    return { child, images, products, packages, orders };
+  };
+
+  const data = isParent
+    ? await asGuardianRls(pool, session!.guardianId, (c) => load(c))
+    : await load(pool);
+  if (!data) return res.status(404).send(NOT_FOUND_PAGE());
+  const { images, products, packages, orders } = data;
+  const c = data.child.rows[0];
   const schoolLabel = c.display_name || c.school_name;
 
-  const images = await pool.query(
-    `select a.id as asset_id, av.storage_key
-       from gallery_item gi
-       join asset a on a.id = gi.asset_id
-       join asset_variant av on av.asset_id = a.id and av.kind = 'preview'
-      where gi.child_id = $1
-      order by gi.sort_order`,
-    [req.params.childId],
-  );
+  // Class and grade are labels only; read after access is established.
+  const label = (await pool.query(
+    `select cl.name as class_name, g.name as grade_name
+       from enrolment e join class_group cl on cl.id = e.class_group_id
+       left join grade g on g.id = cl.grade_id
+      where e.child_id = $1 limit 1`,
+    [childId],
+  )).rows[0] ?? {};
+  c.class_name = label.class_name;
+  c.grade_name = label.grade_name;
 
-  // Real prices, from whatever price list is actually published — the same
-  // one the admin Settings page edits. Nothing here is hardcoded.
-  const priceList = await pool.query(
-    `select id from price_list where studio_id = (select studio_id from child where id = $1)
-       and status = 'published' order by effective_from desc limit 1`,
-    [req.params.childId],
-  );
-  const products = priceList.rows[0]
-    ? await pool.query(
-        `select p.id, p.name_i18n->>'en' as name, pr.amount_cents
-           from product p join price pr on pr.product_id = p.id and pr.price_list_id = $1
-          where p.studio_id = (select studio_id from child where id = $2) and p.active = true
-          order by pr.amount_cents`,
-        [priceList.rows[0].id, req.params.childId],
-      )
-    : { rows: [] };
-
-  const packages = priceList.rows[0]
-    ? await pool.query(
-        `select pk.id, pk.name_i18n->>'en' as name, pk.description_i18n->>'en' as description,
-                pr.amount_cents
-           from package pk join price pr on pr.package_id = pk.id and pr.price_list_id = $1
-          where pk.studio_id = (select studio_id from child where id = $2) and pk.active = true
-          order by pr.amount_cents`,
-        [priceList.rows[0].id, req.params.childId],
-      )
-    : { rows: [] };
+  const yoco = await yocoStatus(pool, c.studio_id);
+  const cardPayments = yoco.connected;
 
   const grid = images.rows.length
     ? images.rows
@@ -560,10 +672,19 @@ app.get("/g/:childId", async (req, res) => {
     )
     .join("");
 
+  const orderRows = orders.rows
+    .map(
+      (o) => `<a class="prow" href="/order/${escapeHtml(o.order_number)}">
+        <span class="mono">${escapeHtml(o.order_number)}</span>
+        <span class="pill ${o.payment_status === "settled" ? "ok" : ""}">${o.payment_status === "settled" ? "Paid" : "Awaiting payment"}</span>
+        <span class="pmoney">R${(Number(o.total_cents) / 100).toFixed(2)}</span></a>`,
+    )
+    .join("");
+
   res.send(
     page({
       title: `${c.first_name} ${c.last_name}`,
-      nav: NAV,
+      nav: isParent ? PARENT_NAV : NAV,
       body: `
       <style>
         .frame{cursor:pointer;position:relative}
@@ -586,11 +707,16 @@ app.get("/g/:childId", async (req, res) => {
           <span class="cls">${escapeHtml(schoolLabel)}${c.grade_name ? " · " + escapeHtml(c.grade_name) : ""}${c.class_name ? " " + escapeHtml(c.class_name) : ""}</span>
         </div>
       </div>
+      ${isParent ? "" : `<div class="note"><b>Staff preview.</b> This is what the parent sees once they enter
+        the card code. Ordering is disabled here.</div>`}
+      ${orderRows ? `<div class="sectlabel"><span>Your orders</span></div><div class="order-panel">${orderRows}</div>` : ""}
       <div class="sectlabel"><span>Photographs — tap to select</span></div>
       <div class="sheet" id="grid">${grid}</div>
 
       ${
-        products.rows.length === 0 && packages.rows.length === 0
+        !isParent
+          ? ""
+          : products.rows.length === 0 && packages.rows.length === 0
           ? `<div class="note">No products are priced yet — the studio hasn't set up pricing for this school.</div>`
           : `
       <div class="sectlabel"><span>Order</span></div>
@@ -612,13 +738,14 @@ app.get("/g/:childId", async (req, res) => {
         <div id="confirm" style="display:none;margin-top:14px;padding:14px;background:#f0f7f4;border-radius:2px">
           <b>Order received.</b> <span id="ordNum"></span><br>
           <span style="font-size:13px">The studio will be in touch to arrange payment. Once payment is
-          confirmed, any digital images in this order are emailed immediately; prints follow after the
-          school's order deadline.</span>
+          confirmed, digital images in this order are available to download from your order page; prints
+          follow after the school's order deadline.</span>
         </div>
-      </div>`
+      </div>
+      <div class="note">${cardPayments
+        ? "You'll pay securely by card or instant EFT through Yoco. Digital photographs are ready to download the moment payment goes through."
+        : "Payment is arranged with the studio directly. Digital photographs are ready to download as soon as payment is confirmed."}</div>`
       }
-      <div class="note">Real order, real database, real pricing — the one thing not live yet is a card
-        payment gateway. Payment is confirmed by the studio for now.</div>
       <script>
         const picked=new Set();
         document.querySelectorAll('.frame').forEach(f=>{
@@ -680,6 +807,8 @@ app.get("/g/:childId", async (req, res) => {
             });
             const data=await r.json();
             if(!r.ok){ err.textContent=data.message||'Something went wrong.'; placeBtn.disabled=false; update(); return; }
+            if(data.redirectUrl){ placeBtn.textContent='Taking you to secure payment…'; location.href=data.redirectUrl; return; }
+            if(data.orderPage){ location.href=data.orderPage; return; }
             document.getElementById('ordNum').textContent='Order number: '+data.orderNumber;
             document.getElementById('confirm').style.display='block';
             placeBtn.style.display='none';
@@ -688,7 +817,7 @@ app.get("/g/:childId", async (req, res) => {
       </script>`,
     }),
   );
-});
+}
 
 // ── Place an order: real order + order_line rows, real price snapshots ──────
 app.post("/api/order", async (req, res) => {
@@ -706,6 +835,16 @@ app.post("/api/order", async (req, res) => {
     if (!assetIds?.length || (wantProducts.length === 0 && wantPackages.length === 0)) {
       return res.status(400).json({ message: "Select at least one photograph and a package or product." });
     }
+    if (typeof childId !== "string" || !UUID_RE.test(childId)) {
+      return res.status(404).json({ message: "Unknown child." });
+    }
+    // Only a browser that entered this child's card may order for them, and
+    // the order belongs to THAT browser's guardian.
+    const session = await readParentSession(client, req);
+    if (!(await sessionCanViewChild(client, session, childId))) {
+      return res.status(403).json({ message: "Enter your child's code on this device first." });
+    }
+    const guardianId = session!.guardianId;
 
     const child = await client.query(
       `select studio_id, school_id from child where id = $1`, [childId],
@@ -778,15 +917,16 @@ app.post("/api/order", async (req, res) => {
     await client.query("begin");
     await client.query("select set_config('app.actor_kind', 'system', true)");
 
-    let guardian = await client.query(`select id from guardian where email = $1`, [email]);
-    let guardianId = guardian.rows[0]?.id as string | undefined;
-    if (!guardianId) {
-      const r = await client.query(
-        `insert into guardian (email, full_name) values ($1, $2) returning id`,
-        [email, email.split("@")[0]],
-      );
-      guardianId = r.rows[0].id;
-    }
+    // The email is a receipt address only. The guardian was decided by the
+    // session above; looking one up by typed email let anyone attach orders
+    // and downloads to another parent's account. If this guardian still has
+    // a placeholder address, adopt this one — unless another account has it.
+    await client.query(
+      `update guardian set email = $2
+        where id = $1 and email like '%@claim.invalid'
+          and not exists (select 1 from guardian g2 where g2.email = $2)`,
+      [guardianId, email],
+    );
 
     let subtotal = 0;
     const lines: Array<{
@@ -832,9 +972,10 @@ app.post("/api/order", async (req, res) => {
     const orderNumber = generateOrderNumber("WJ");
     const order = await client.query(
       `insert into "order" (studio_id, school_id, shoot_id, guardian_id, order_number,
-                            subtotal_cents, total_cents, payment_status, digital_status)
-       values ($1,$2,$3,$4,$5,$6,$6,'pending','pending') returning id`,
-      [studioId, schoolId, shootId, guardianId, orderNumber, subtotal],
+                            subtotal_cents, total_cents, payment_status, digital_status, contact_email)
+       values ($1,$2,$3,$4,$5,$6,$6,'pending',$7,$8) returning id`,
+      [studioId, schoolId, shootId, guardianId, orderNumber, subtotal,
+       lines.some((l) => l.isDigital) ? "pending" : "none", email],
     );
     const orderId = order.rows[0].id;
 
@@ -856,7 +997,16 @@ app.post("/api/order", async (req, res) => {
     }
 
     await client.query("commit");
-    res.json({ orderNumber, total: subtotal });
+
+    // Card payment, if Yoco is connected. A Yoco outage must not lose the
+    // order: it is already committed, and the order page offers "Pay now".
+    let redirectUrl: string | null = null;
+    try {
+      redirectUrl = await startCheckout(pool, orderId, `${req.protocol}://${req.get("host")}`);
+    } catch (err) {
+      console.error({ event: "yoco.checkout.failed", orderNumber, err: (err as Error).message });
+    }
+    res.json({ orderNumber, total: subtotal, redirectUrl, orderPage: `/order/${orderNumber}` });
   } catch (err) {
     await client.query("rollback");
     console.error(err);
@@ -866,9 +1016,186 @@ app.post("/api/order", async (req, res) => {
   }
 });
 
+// ── Parent order page: status, pay, downloads ──────────────────────────────
+const ORDER_NO_RE = /^[0-9A-Z-]{4,40}$/;
+
+async function loadOwnOrder(req: express.Request, orderNumber: string) {
+  if (!ORDER_NO_RE.test(orderNumber)) return null;
+  const session = await readParentSession(pool, req);
+  if (!session) return null;
+  const o = (await pool.query(
+    `select o.id, o.order_number, o.total_cents, o.payment_status, o.digital_status, o.studio_id,
+            o.placed_at, o.contact_email,
+            array(select distinct ol.child_id from order_line ol where ol.order_id = o.id) as child_ids
+       from "order" o where o.order_number = $1 and o.guardian_id = $2`,
+    [orderNumber, session.guardianId],
+  )).rows[0];
+  if (!o) return null;
+  // Belonging to the guardian is not enough: this browser must also hold the
+  // card for every child on the order.
+  for (const cid of o.child_ids as string[]) {
+    if (!(await sessionCanViewChild(pool, session, cid))) return null;
+  }
+  return { session, o };
+}
+
+app.get("/order/:orderNumber", async (req, res) => {
+  const own = await loadOwnOrder(req, req.params.orderNumber);
+  if (!own) return res.status(404).send(LOCKED_PAGE());
+  const { session, o } = own;
+
+  const data = await asGuardianRls(pool, session.guardianId, async (c) => {
+    const lines = await c.query(
+      `select line_no, kind, line_total_cents, fulfilment_kind, snapshot->>'name' as name
+         from order_line where order_id = $1 order by line_no`,
+      [o.id],
+    );
+    const grants = await c.query(
+      `select dg.id, dg.downloads, dg.max_downloads, dg.expires_at, av.storage_key as thumb
+         from download_grant dg
+         left join asset_variant av on av.asset_id = dg.asset_id and av.kind = 'thumb'
+        where dg.order_id = $1 and dg.guardian_id = $2 and dg.revoked_at is null
+        order by dg.created_at`,
+      [o.id, session.guardianId],
+    );
+    return { lines: lines.rows, grants: grants.rows };
+  });
+
+  const yoco = await yocoStatus(pool, o.studio_id);
+  const paid = o.payment_status === "settled";
+  const q = req.query as Record<string, string>;
+  const polls = Number(q.poll ?? 0);
+  const awaitingWebhook = !paid && (q.returned === "1" || (q.poll && polls < 20)) && o.payment_status === "initiated";
+  const canPay = !paid && yoco.connected && Number(o.total_cents) >= 200;
+
+  let status: string;
+  if (paid) status = `<b>Paid — thank you.</b>`;
+  else if (awaitingWebhook) status = `<b>Confirming your payment…</b> This page updates by itself in a moment.`;
+  else if (q.cancelled === "1") status = `Payment was cancelled. Your order is saved — you can pay whenever you're ready.`;
+  else if (q.failed === "1" || o.payment_status === "failed") status = `The payment didn't go through. Nothing was charged — please try again.`;
+  else if (canPay) status = `Awaiting payment.`;
+  else status = `Awaiting payment. The studio will be in touch to arrange it.`;
+
+  const lineRows = data.lines
+    .map((l: any) => `<div class="prow"><span>${escapeHtml(l.name ?? l.kind)}</span>
+        <span class="mono" style="font-size:11px;color:var(--silver)">${l.fulfilment_kind === "digital" ? "digital" : "print"}</span>
+        <span class="pmoney">R${(Number(l.line_total_cents) / 100).toFixed(2)}</span></div>`)
+    .join("");
+
+  const downloads = data.grants.length
+    ? `<div class="sectlabel"><span>Your digital photographs</span></div>
+       <div class="sheet">${data.grants
+         .map((g: any) => `<div class="frame">
+             ${g.thumb ? `<img src="${publicUrl(g.thumb)}" alt="">` : ""}
+             <a class="btn" style="display:block;text-align:center;margin-top:6px;padding:8px"
+                href="/download/${g.id}">Download</a></div>`)
+         .join("")}</div>
+       <div class="note">Full-resolution files without watermark. Each link works on this device for a year.</div>`
+    : paid && o.digital_status === "none"
+    ? `<div class="note">Your prints will be printed after the school's order deadline and delivered to the school.</div>`
+    : "";
+
+  res.send(page({
+    title: `Order ${o.order_number}`,
+    nav: PARENT_NAV,
+    body: `
+    ${awaitingWebhook ? `<meta http-equiv="refresh" content="3;url=/order/${o.order_number}?poll=${polls + 1}">` : ""}
+    <div class="sheet-head"><div class="kid"><h1>Order ${escapeHtml(o.order_number)}</h1>
+      <span class="cls">${escapeHtml(o.contact_email ?? "")}</span></div></div>
+    <div class="order-panel" style="background:#fff;border:1px solid var(--rule);border-radius:4px;padding:16px">
+      <p style="margin-bottom:10px">${status}</p>
+      ${lineRows}
+      <div class="prow" style="font-weight:600"><span>Total</span><span class="pmoney">R${(Number(o.total_cents) / 100).toFixed(2)}</span></div>
+      ${canPay && !awaitingWebhook
+        ? `<form method="post" action="/order/${o.order_number}/pay"><button class="btn" type="submit">Pay R${(Number(o.total_cents) / 100).toFixed(2)} now</button></form>`
+        : ""}
+    </div>
+    ${downloads}
+    <p style="margin-top:16px"><a href="/g/${(o.child_ids as string[])[0]}" style="text-decoration:underline">← Back to the photographs</a></p>`,
+  }));
+});
+
+app.post("/order/:orderNumber/pay", async (req, res) => {
+  const own = await loadOwnOrder(req, req.params.orderNumber);
+  if (!own) return res.status(404).send(LOCKED_PAGE());
+  try {
+    const url = await startCheckout(pool, own.o.id, `${req.protocol}://${req.get("host")}`);
+    if (url) return res.redirect(303, url);
+  } catch (err) {
+    console.error({ event: "yoco.checkout.failed", orderNumber: own.o.order_number, err: (err as Error).message });
+  }
+  res.redirect(303, `/order/${own.o.order_number}?failed=1`);
+});
+
+// Full-resolution original, only to the guardian the grant was issued to, and
+// only from a browser holding that child's card. This is the ONLY route that
+// ever reads an original off the volume.
+app.get("/download/:grantId", async (req, res) => {
+  if (!UUID_RE.test(req.params.grantId)) return res.status(404).send(NOT_FOUND_PAGE());
+  const session = await readParentSession(pool, req);
+  if (!session) return res.status(404).send(LOCKED_PAGE());
+  const g = (await pool.query(
+    `update download_grant dg set downloads = downloads + 1
+       from asset a, "order" o
+      where dg.id = $1 and dg.guardian_id = $2 and dg.revoked_at is null
+        and dg.expires_at > now() and dg.downloads < dg.max_downloads
+        and a.id = dg.asset_id and o.id = dg.order_id and o.payment_status = 'settled'
+      returning a.storage_key, a.original_name, dg.order_id`,
+    [req.params.grantId, session.guardianId],
+  )).rows[0];
+  if (!g) return res.status(404).send(page({ title: "Download unavailable", nav: PARENT_NAV,
+    body: `<div class="empty">This download is not available. It may have expired or reached its download limit — contact the studio.</div>` }));
+  const childOk = (await pool.query(
+    `select array(select distinct child_id from order_line where order_id = $1) as ids`, [g.order_id],
+  )).rows[0].ids as string[];
+  for (const cid of childOk) {
+    if (!(await sessionCanViewChild(pool, session, cid))) return res.status(404).send(LOCKED_PAGE());
+  }
+  const bytes = await getObject(g.storage_key);
+  const name = String(g.original_name ?? "photograph.jpg").replace(/[^\w.\- ]/g, "_");
+  res.setHeader("Content-Type", "image/jpeg");
+  res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+  res.setHeader("Cache-Control", "private, no-store");
+  res.send(bytes);
+});
+
 // ============================================================================
 // ADMIN — multi-school, with everything editable
 // ============================================================================
+
+function paymentsPanel(y: Awaited<ReturnType<typeof yocoStatus>>): string {
+  const input = `<input name="secret_key" type="password" autocomplete="off" placeholder="sk_live_… or sk_test_…"
+       style="flex:1;min-width:240px;padding:9px;border:1px solid var(--rule);border-radius:2px">`;
+  if (!y.connected) {
+    return `<div class="note">Not connected — parents can order, and you confirm payment with "Mark paid".
+        To take card payments, paste your <b>secret key</b> from the Yoco app
+        (Yoco Connect → Checkout API → How to connect). Everything else is set up automatically.
+        ${y.lastError ? `<br><span style="color:var(--chinagraph)">${escapeHtml(y.lastError)}</span>` : ""}</div>
+      <form method="post" action="/admin/payments" style="display:flex;gap:6px;flex-wrap:wrap;max-width:560px">
+        ${input}<button type="submit" class="btn" style="width:auto;padding:9px 16px">Connect Yoco</button></form>`;
+  }
+  const mode = y.mode === "live" ? `<span class="pill ok">Live</span>` : `<span class="pill">Test mode</span>`;
+  const hook = y.webhookReady
+    ? `<span class="pill ok">Automatic confirmation on</span>`
+    : `<span class="pill">Automatic confirmation not set up</span>`;
+  return `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">${mode} ${hook}</div>
+    ${y.mode === "test" ? `<div class="note">Test mode: no real money moves. Switch to your live key once Yoco has verified this website.</div>` : ""}
+    ${y.lastError && !y.webhookReady ? `<div class="note" style="color:var(--chinagraph)">${escapeHtml(y.lastError)}</div>` : ""}
+    ${y.source === "env"
+      ? `<div class="note">The key is set on the server (YOCO_SECRET_KEY), so it can't be changed here.</div>`
+      : `<form method="post" action="/admin/payments" style="display:flex;gap:6px;flex-wrap:wrap;max-width:560px">
+           ${input}<button type="submit" class="btn" style="width:auto;padding:9px 16px">Replace key</button></form>
+         <form method="post" action="/admin/payments" style="margin-top:6px"
+               onsubmit="return confirm('Disconnect Yoco? Parents will no longer be able to pay by card.')">
+           <input type="hidden" name="secret_key" value=""><button type="submit" class="pill">Disconnect</button></form>`}`;
+}
+
+app.post("/admin/payments", async (req, res) => {
+  const { studioId } = await ensureStudioAndStaff();
+  if (process.env.YOCO_SECRET_KEY) return res.redirect(303, "/admin");
+  await saveYocoKey(pool, studioId, String(req.body.secret_key ?? ""));
+  res.redirect(303, "/admin");
+});
 
 app.get("/admin", async (req, res) => {
   const { studioId } = await ensureStudioAndStaff();
@@ -948,9 +1275,10 @@ app.get("/admin", async (req, res) => {
     : { rows: [] };
   const priceByProduct = new Map(prices.rows.map((r: any) => [r.product_id, r.amount_cents]));
 
+  const yoco = await yocoStatus(pool, studioId);
   const orders = await pool.query(
     `select o.id, o.order_number, o.total_cents, o.payment_status, o.digital_status,
-            o.fulfilment_status, g.email
+            o.fulfilment_status, coalesce(o.contact_email, g.email) as email
        from "order" o join guardian g on g.id = o.guardian_id
       where o.school_id = $1 order by o.placed_at desc limit 50`,
     [selected.id],
@@ -980,6 +1308,9 @@ app.get("/admin", async (req, res) => {
         <div class="stat"><div class="n">${n.assets}</div><div class="l">Photographs</div></div>
         <div class="stat"><div class="n">${n.codes_redeemed}/${n.codes_issued}</div><div class="l">Codes claimed</div></div>
       </div>
+
+      <div class="sectlabel"><span>Card payments (Yoco)</span></div>
+      ${paymentsPanel(yoco)}
 
       <div class="sectlabel"><span>School details</span></div>
       <form method="post" action="/admin/school/${selected.id}" style="display:grid;gap:8px;max-width:420px">
@@ -1051,9 +1382,9 @@ app.get("/admin", async (req, res) => {
             )
             .join("")}
           </tbody></table>
-          <div class="note">"Mark paid" is the real payment confirmation step until a card gateway is
-            connected — it settles the order and, if it contains any digital lines, emails them
-            immediately (the digital-release gate is enforced in the database, not just here).</div>`
+          <div class="note">Card payments through Yoco settle automatically and release digital
+            photographs to the parent straight away. Use "Mark paid" only for cash or EFT — it does
+            exactly the same thing.</div>`
       }
 
       <div class="sectlabel"><span>Children</span></div>
@@ -1071,13 +1402,13 @@ app.get("/admin", async (req, res) => {
           ? q
             ? `<div class="empty">No children match "${escapeHtml(q)}".</div>`
             : `<div class="empty">No children at this school yet.</div>`
-          : `<table><thead><tr><th>Name</th><th>Photographs</th><th>Gallery link</th><th>Claim cards</th><th>Claimed</th></tr></thead><tbody>
+          : `<table><thead><tr><th>Name</th><th>Photographs</th><th>Gallery</th><th>Claim cards</th><th>Claimed</th></tr></thead><tbody>
           ${children.rows
             .map(
               (r) => `<tr>
                 <td>${escapeHtml(r.first_name)} ${escapeHtml(r.last_name)}</td>
                 <td>${r.photo_count}</td>
-                <td><a href="/g/${r.id}" class="mono" style="text-decoration:underline">/g/${r.id.slice(0, 8)}…</a></td>
+                <td><a href="/admin/preview/${r.id}" style="text-decoration:underline">Preview gallery →</a></td>
                 <td><a href="/admin/cards/${selected.id}" style="text-decoration:underline">Print sheet →</a></td>
                 <td><span class="pill ${r.claimed ? "ok" : ""}">${r.claimed ? "Claimed" : "Not yet"}</span></td>
               </tr>`,
@@ -1092,30 +1423,21 @@ app.get("/admin", async (req, res) => {
 });
 
 app.post("/admin/order/:id/mark-paid", async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return res.status(404).send("Unknown order.");
   const client = await pool.connect();
   try {
+    await client.query("begin");
     await client.query("select set_config('app.actor_kind', 'system', true)");
-
-    // Two updates, in order: settle payment first, then release digital.
-    // The digital-release gate (migration 0013, enforce_digital_gate) refuses
-    // to mark digital_status='delivered' while payment_status is not settled —
-    // this order of operations is not cosmetic, it is what makes the trigger
-    // actually protect anything.
-    await client.query(`update "order" set payment_status = 'settled' where id = $1`, [req.params.id]);
-
-    const hasDigital = await client.query(
-      `select 1 from order_line where order_id = $1 and fulfilment_kind = 'digital' limit 1`,
-      [req.params.id],
-    );
-    if (hasDigital.rowCount! > 0) {
-      await client.query(`update "order" set digital_status = 'delivered' where id = $1`, [req.params.id]);
-    }
-
+    // Same path as a Yoco webhook: settle, then grant digital downloads.
+    // The digital-release gate (0013) still refuses delivery while unpaid.
+    await settleOrder(client, req.params.id);
     const school = await client.query(`select school_id from "order" where id = $1`, [req.params.id]);
+    await client.query("commit");
     res.redirect(`/admin?school=${school.rows[0].school_id}`);
   } catch (err) {
+    await client.query("rollback").catch(() => {});
     console.error(err);
-    res.status(500).send("Error marking order paid: " + (err as Error).message);
+    res.status(500).send("Error marking order paid: " + escapeHtml((err as Error).message));
   } finally {
     client.release();
   }
@@ -1573,7 +1895,15 @@ app.post("/api/import/:batchId/commit", async (req, res) => {
 app.get("/api/health", async (_req, res) => {
   try {
     await pool.query("select 1");
-    res.json({ ok: true, db: "connected" });
+    const studio = (await pool.query(`select id from studio limit 1`)).rows[0];
+    const y = studio ? await yocoStatus(pool, studio.id) : null;
+    res.json({
+      ok: true,
+      db: "connected",
+      migrations: bootState.migrations,
+      parentAccess: rlsEnforcedForParents() ? "session+rls" : "session",
+      payments: y?.connected ? { provider: "yoco", mode: y.mode, webhook: y.webhookReady } : { provider: "manual" },
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: (err as Error).message });
   }
@@ -1618,6 +1948,16 @@ app.post("/admin/api/school/:id/delete", requireStaffAuth, async (req, res) => {
     // cascade — most foreign keys in this schema are RESTRICT deliberately
     // (§5.4: soft state, not soft delete, is the default), so a maintenance
     // tool that actually needs hard deletion has to walk the graph itself.
+    // Orders and everything hanging off them, then parent bindings.
+    await client.query(`delete from download_grant where order_id in (select id from "order" where school_id = $1)`, [id]);
+    await client.query(`update payment_event set order_id = null where order_id in (select id from "order" where school_id = $1)`, [id]);
+    await client.query(`delete from payment where order_id in (select id from "order" where school_id = $1)`, [id]);
+    await client.query(`delete from order_line where order_id in (select id from "order" where school_id = $1)`, [id]);
+    await client.query(`delete from "order" where school_id = $1`, [id]);
+    await client.query(`delete from consent_record where child_id in (select id from child where school_id = $1)`, [id]);
+    await client.query(`delete from guardian_child where child_id in (select id from child where school_id = $1)`, [id]);
+    await client.query(`delete from claim_attempt where claim_code_id in (select id from claim_code where shoot_id in
+      (select id from shoot where school_id = $1))`, [id]);
     await client.query(
       `delete from gallery_item where asset_id in (select id from asset where shoot_id in
          (select id from shoot where school_id = $1))`, [id],
@@ -1635,6 +1975,12 @@ app.post("/admin/api/school/:id/delete", requireStaffAuth, async (req, res) => {
     await client.query(`delete from grade where school_id = $1`, [id]);
     await client.query(`delete from child where school_id = $1`, [id]);
     await client.query(`delete from school where id = $1`, [id]);
+    // A guardian with no children, orders or consent left is personal data
+    // with no purpose (POPIA s14) — remove it with the school.
+    await client.query(`delete from guardian g where true
+      and not exists (select 1 from guardian_child gc where gc.guardian_id = g.id)
+      and not exists (select 1 from "order" o where o.guardian_id = g.id)
+      and not exists (select 1 from consent_record cr where cr.guardian_id = g.id)`);
     await client.query("commit");
     res.json({ deleted: id });
   } catch (err) {
@@ -1644,6 +1990,21 @@ app.post("/admin/api/school/:id/delete", requireStaffAuth, async (req, res) => {
     client.release();
   }
 });
+
+const bootState = { migrations: "pending" as string };
+
+// Boot: bring the schema up to date, find out whether the database can
+// enforce parent isolation itself, and make sure Yoco knows where to call.
+// None of it needs a human; failures are logged and surfaced on /api/health.
+const migration = await migrateOnBoot(pool);
+bootState.migrations = migration.status;
+await probeRlsRole(pool);
+try {
+  const { studioId } = await ensureStudioAndStaff();
+  await ensureYocoWebhook(pool, studioId);
+} catch (err) {
+  console.error({ event: "boot.payments", err: (err as Error).message });
+}
 
 app.listen(PORT, () => {
   console.log(`\n  Server running on port ${PORT}. (auto-deploy pipeline verified)`);

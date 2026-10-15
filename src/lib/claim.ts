@@ -192,8 +192,14 @@ export async function redeemClaimCode(
       // intercepted, this is the message that tells the real parent something
       // is wrong — and it is the signal that brings them to the studio.
       await record("already_redeemed", r.id);
+      // The ids are returned so the caller can let the card holder back in
+      // (a second phone, the other parent). The code stays burned; only the
+      // first redemption records redeemed_by.
       return {
         outcome: "already_redeemed",
+        childId: r.child_id,
+        shootId: r.shoot_id,
+        claimCodeId: r.id,
         message:
           "This code has already been used. Sign in with the account it was linked to, " +
           "or contact the studio if that was not you.",

@@ -14,7 +14,8 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run test && npm run db:test",
-    "start": "tsx src/server/import-server.ts"
+    "start": "tsx src/server/import-server.ts",
+    "e2e": "tsx scripts/e2e-parent-isolation.ts"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.0.2",
