@@ -110,7 +110,7 @@ async function main() {
     // ── Ordering across the boundary ────────────────────────────────────────
     const assetsA = [...gaHtml.matchAll(/data-asset="([0-9a-f-]+)"/g)].map((m) => m[1]!);
     const assetsB = [...gbHtml.matchAll(/data-asset="([0-9a-f-]+)"/g)].map((m) => m[1]!);
-    const products = [...gaHtml.matchAll(/class="prod" value="([0-9a-f-]+)" data-name="([^"]*)" data-cents="(\d+)"/g)]
+    const products = [...gaHtml.matchAll(/class="prod" value="([0-9a-f-]+)" data-name="([^"]*)"\s+data-cents="(\d+)"/g)]
       .map((m) => ({ id: m[1]!, name: m[2]!, cents: Number(m[3]) }));
     const digital = products.find((p) => /digital/i.test(p.name))!;
     const print = products.find((p) => /A4/i.test(p.name))!;

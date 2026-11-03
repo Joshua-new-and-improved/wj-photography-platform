@@ -4,7 +4,7 @@ import QRCode from "qrcode";
 import { Pool } from "pg";
 import { randomUUID } from "node:crypto";
 
-import { proposeStructure, similarity, type UploadedFile } from "../lib/import/folders.js";
+import { proposeStructure, similarity, parseGrade, parseClass, compactName, type UploadedFile } from "../lib/import/folders.js";
 import { childFolderFromPath } from "../lib/import/childfolder.js";
 import { segmentBySlates, reviewSummary, type Frame } from "../lib/import/segment.js";
 import { deriveVariants } from "../lib/media/derive.js";
@@ -12,6 +12,7 @@ import { putObject, publicUrl, randomKey } from "../lib/storage/local.js";
 import { issueClaimCode, redeemClaimCode, completeClaim } from "../lib/claim.js";
 import { generateOrderNumber, normaliseCode } from "../lib/ids.js";
 import { page, escapeHtml } from "./views.js";
+import { formatRands, parseRands, randsInputValue, FORMAT_RANDS_JS } from "../lib/commerce/money.js";
 import { getObject } from "../lib/storage/local.js";
 import { migrateOnBoot } from "./migrate.js";
 import {
@@ -386,7 +387,7 @@ app.get("/", (_req, res) => {
       body: `
       <div class="claim">
         <h1>Find your child's<br>photographs</h1>
-        <p>Enter the code from the letter. No account needed to look.</p>
+        <p>Scan the QR code on your child's card, or type the code printed under it.</p>
         <div class="codebox">
           <input class="g4 mono" id="c1" maxlength="4" placeholder="XXXX" autocomplete="off">
           <input class="g3 mono" id="c2" maxlength="3" placeholder="XXX" autocomplete="off">
@@ -395,6 +396,13 @@ app.get("/", (_req, res) => {
         <div class="err" id="err"></div>
         <button class="btn" id="go">Show me the photographs</button>
       </div>
+      <div class="how">
+        <div><b>01</b><p>Enter the code from the card your child brought home.</p></div>
+        <div><b>02</b><p>Choose your favourite photographs and a package or prints.</p></div>
+        <div><b>03</b><p>Pay securely. Digital copies download immediately; prints are delivered to the school.</p></div>
+      </div>
+      <p class="helpline">Lost the card or the code doesn't work? Contact the studio via
+        <a href="https://wjphotography.co.za" style="text-decoration:underline">wjphotography.co.za</a>.</p>
       <script>
         const $=id=>document.getElementById(id);
         ['c1','c2','c3'].forEach((id,i,arr)=>{
@@ -404,6 +412,14 @@ app.get("/", (_req, res) => {
                      .replace(/[^0-9A-HJKMNP-TV-Z]/g,'');
             if(el.value.length===el.maxLength && arr[i+1]) $(arr[i+1]).focus();
           };
+        });
+        // Pasting the whole code into any box fills all three; Enter submits.
+        ['c1','c2','c3'].forEach(id=>{
+          $(id).addEventListener('paste',e=>{
+            const t=(e.clipboardData.getData('text')||'').toUpperCase().replace(/[^0-9A-Z]/g,'');
+            if(t.length>=10){ e.preventDefault(); $('c1').value=t.slice(0,4); $('c2').value=t.slice(4,7); $('c3').value=t.slice(7,10); $('go').focus(); }
+          });
+          $(id).addEventListener('keydown',e=>{ if(e.key==='Enter') $('go').click(); });
         });
         // The QR code on the printed card opens /?code=XXXX-XXX-XXX: fill the
         // boxes and go straight through, so a scan is one tap, not a retype.
@@ -593,7 +609,7 @@ async function renderGallery(req: express.Request, res: express.Response, childI
     );
     const products = priceList.rows[0]
       ? await db.query(
-          `select p.id, p.name_i18n->>'en' as name, pr.amount_cents
+          `select p.id, p.name_i18n->>'en' as name, p.kind, pr.amount_cents
              from product p join price pr on pr.product_id = p.id and pr.price_list_id = $1
             where p.studio_id = $2 and p.active = true
             order by pr.amount_cents`,
@@ -643,177 +659,192 @@ async function renderGallery(req: express.Request, res: express.Response, childI
   const yoco = await yocoStatus(pool, c.studio_id);
   const cardPayments = yoco.connected;
 
+  const firstName = c.first_name as string;
+  const classLine = [schoolLabel, c.grade_name, c.class_name ? `Class ${c.class_name}` : null].filter(Boolean).join(" · ");
+
   const grid = images.rows.length
     ? images.rows
         .map(
-          (r) => `<div class="frame" data-asset="${r.asset_id}" tabindex="0" role="button">
-            <img src="${publicUrl(r.storage_key)}" alt="">
-            <div class="pickmark">✓</div>
-          </div>`,
+          (r, i) => `<figure class="frame" data-asset="${r.asset_id}" data-i="${i}">
+            <button type="button" class="view" aria-label="View photograph ${i + 1} larger">
+              <img src="${publicUrl(r.storage_key)}" alt="Photograph ${i + 1} of ${escapeHtml(firstName)}" loading="lazy">
+            </button>
+            ${isParent ? `<button type="button" class="pick" aria-pressed="false" aria-label="Choose photograph ${i + 1}">
+              <span class="tick">✓</span><span class="picklabel">Choose</span></button>` : ""}
+          </figure>`,
         )
         .join("")
-    : `<div class="empty">No photographs in this gallery yet.</div>`;
+    : `<div class="empty">No photographs in this gallery yet — check back soon.</div>`;
 
-  const productRows = products.rows
-    .map(
-      (p) =>
-        `<label class="prow"><input type="checkbox" class="prod" value="${p.id}" data-name="${escapeHtml(p.name)}" data-cents="${p.amount_cents}">
-           <span>${escapeHtml(p.name)}</span><span class="pmoney">R${(p.amount_cents / 100).toFixed(2)}</span></label>`,
-    )
+  // "Per photo" products are charged once for every chosen photograph; a
+  // full digital gallery is one price for all of them. The server applies
+  // exactly the same rule when it prices the order.
+  const productRow = (p: any) => {
+    const once = p.kind === "digital_gallery";
+    return `<label class="opt">
+      <input type="checkbox" class="prod" value="${p.id}" data-name="${escapeHtml(p.name)}"
+             data-cents="${Number(p.amount_cents)}" data-once="${once ? 1 : 0}">
+      <span class="optname">${escapeHtml(p.name)}
+        <small>${once ? "All of " + escapeHtml(firstName) + "'s photographs, one price" : "Per photograph you choose"}${p.kind?.startsWith("digital") ? " · instant download" : ""}</small></span>
+      <span class="money">${formatRands(p.amount_cents)}</span></label>`;
+  };
+  const groups: Array<[string, (p: any) => boolean]> = [
+    ["Prints", (p) => p.kind === "print"],
+    ["Digital", (p) => p.kind === "digital_single" || p.kind === "digital_gallery"],
+    ["Gifts", (p) => p.kind === "merch"],
+  ];
+  const productBlocks = groups
+    .map(([title, f]) => {
+      const rows = products.rows.filter(f);
+      return rows.length ? `<div class="optgroup">${title}</div>${rows.map(productRow).join("")}` : "";
+    })
     .join("");
 
-  const packageRows = packages.rows
+  const packageCards = packages.rows
     .map(
-      (p) =>
-        `<label class="prow"><input type="checkbox" class="pkg" value="${p.id}" data-name="${escapeHtml(p.name)}" data-cents="${p.amount_cents}">
-           <span><b>${escapeHtml(p.name)}</b><br>
-             <span style="font-size:12px;color:var(--silver)">${escapeHtml(p.description ?? "")}</span></span>
-           <span class="pmoney">R${(p.amount_cents / 100).toFixed(2)}</span></label>`,
+      (p) => `<label class="pkg">
+        <input type="checkbox" class="pkgchk" value="${p.id}" data-name="${escapeHtml(p.name)}" data-cents="${Number(p.amount_cents)}">
+        <span class="pkgname">${escapeHtml(p.name)}</span>
+        <span class="pkgprice">${formatRands(p.amount_cents)}</span>
+        <span class="pkgdesc">${escapeHtml(p.description ?? "")}</span>
+      </label>`,
     )
     .join("");
 
   const orderRows = orders.rows
     .map(
-      (o) => `<a class="prow" href="/order/${escapeHtml(o.order_number)}">
+      (o) => `<a class="orderlink" href="/order/${escapeHtml(o.order_number)}">
         <span class="mono">${escapeHtml(o.order_number)}</span>
         <span class="pill ${o.payment_status === "settled" ? "ok" : ""}">${o.payment_status === "settled" ? "Paid" : "Awaiting payment"}</span>
-        <span class="pmoney">R${(Number(o.total_cents) / 100).toFixed(2)}</span></a>`,
+        <span class="money">${formatRands(o.total_cents)}</span><span aria-hidden="true">→</span></a>`,
     )
     .join("");
 
+  const canOrder = isParent && (products.rows.length > 0 || packages.rows.length > 0) && images.rows.length > 0;
+
   res.send(
     page({
-      title: `${c.first_name} ${c.last_name}`,
+      title: `${c.first_name} ${c.last_name} — photographs`,
       nav: isParent ? PARENT_NAV : NAV,
       body: `
-      <style>
-        .frame{cursor:pointer;position:relative}
-        .frame .pickmark{position:absolute;top:6px;right:6px;width:22px;height:22px;border-radius:99px;
-          background:var(--paper);border:1px solid var(--rule);display:flex;align-items:center;justify-content:center;
-          font-size:12px;color:transparent}
-        .frame.picked{outline:2px solid var(--chinagraph)}
-        .frame.picked .pickmark{background:var(--chinagraph);color:#fff;border-color:var(--chinagraph)}
-        .order-panel{background:#fff;border:1px solid var(--rule);border-radius:4px;padding:16px;margin-top:12px}
-        .prow{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--rule);cursor:pointer}
-        .prow:last-child{border:0}
-        .pmoney{margin-left:auto;font-family:var(--mono)}
-        .ordertotal{display:flex;justify-content:space-between;padding-top:12px;margin-top:4px;
-          border-top:1px solid var(--graphite);font-weight:600;font-size:16px}
-        input[type=email]{width:100%;padding:10px;border:1px solid var(--rule);border-radius:2px;margin:10px 0}
-      </style>
-      <div class="sheet-head">
-        <div class="kid">
-          <h1>${escapeHtml(c.first_name)}</h1>
-          <span class="cls">${escapeHtml(schoolLabel)}${c.grade_name ? " · " + escapeHtml(c.grade_name) : ""}${c.class_name ? " " + escapeHtml(c.class_name) : ""}</span>
-        </div>
-      </div>
-      ${isParent ? "" : `<div class="note"><b>Staff preview.</b> This is what the parent sees once they enter
-        the card code. Ordering is disabled here.</div>`}
-      ${orderRows ? `<div class="sectlabel"><span>Your orders</span></div><div class="order-panel">${orderRows}</div>` : ""}
-      <div class="sectlabel"><span>Photographs — tap to select</span></div>
-      <div class="sheet" id="grid">${grid}</div>
+      ${isParent ? "" : `<div class="flash">Staff preview — this is what the parent sees after entering the card code. Ordering is switched off here.</div>`}
+      <section class="hero">
+        <p class="eyebrow">${escapeHtml(classLine)}</p>
+        <h1>${escapeHtml(firstName)}'s photographs</h1>
+        ${canOrder ? `<ol class="steps"><li>Choose your favourite photographs</li><li>Pick a package or prints</li><li>Pay securely — digital copies download straight away</li></ol>` : ""}
+      </section>
 
-      ${
-        !isParent
-          ? ""
-          : products.rows.length === 0 && packages.rows.length === 0
-          ? `<div class="note">No products are priced yet — the studio hasn't set up pricing for this school.</div>`
-          : `
-      <div class="sectlabel"><span>Order</span></div>
-      <div class="order-panel">
-        <div id="pickCount" class="mono" style="color:var(--silver);font-size:12px;margin-bottom:10px">No photographs selected</div>
-        ${
-          packageRows
-            ? `<div class="mono" style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;
-                 color:var(--silver);margin:4px 0 6px">Packages — best value</div>${packageRows}
-               <div class="mono" style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;
-                 color:var(--silver);margin:16px 0 6px">Or order individually</div>`
-            : ""
-        }
-        ${productRows}
-        <div class="ordertotal"><span>Total</span><span id="total">R0.00</span></div>
-        <input type="email" id="email" placeholder="Your email address" required>
-        <div id="emailErr" style="color:var(--chinagraph);font-size:12px;min-height:16px"></div>
-        <button class="btn" id="place" disabled>Select photographs and products to order</button>
-        <div id="confirm" style="display:none;margin-top:14px;padding:14px;background:#f0f7f4;border-radius:2px">
-          <b>Order received.</b> <span id="ordNum"></span><br>
-          <span style="font-size:13px">The studio will be in touch to arrange payment. Once payment is
-          confirmed, digital images in this order are available to download from your order page; prints
-          follow after the school's order deadline.</span>
-        </div>
+      ${orderRows ? `<div class="sectlabel"><span>Your orders</span></div><div class="orders">${orderRows}</div>` : ""}
+
+      <div class="sectlabel"><span>${images.rows.length} photograph${images.rows.length === 1 ? "" : "s"}${canOrder ? " — tap to view, “Choose” to select" : ""}</span></div>
+      <div class="gallery" id="grid">${grid}</div>
+
+      ${!isParent ? "" : !canOrder
+        ? `<div class="note">Ordering opens as soon as the studio has published prices.</div>`
+        : `
+      <div class="sectlabel" id="orderstart"><span>Packages — best value</span></div>
+      ${packageCards ? `<div class="pkgs">${packageCards}</div>` : `<div class="hint">No packages this time — choose individual items below.</div>`}
+
+      <div class="sectlabel"><span>Or choose individually</span></div>
+      <div class="opts">${productBlocks}</div>
+
+      <div class="sectlabel"><span>Your order</span></div>
+      <div class="summary" id="summary">
+        <div id="lines" class="lines"><div class="hint">Choose photographs and at least one package or item.</div></div>
+        <div class="totalrow"><span>Total</span><span id="total" class="money">R0</span></div>
+        <label class="field">Email for your receipt
+          <input type="email" id="email" autocomplete="email" placeholder="you@example.com" required></label>
+        <div id="err" class="err" role="alert"></div>
+        <button class="btn" id="place" disabled>Choose photographs to start</button>
+        <p class="fine">${cardPayments
+          ? "You'll pay on Yoco's secure page — card or instant EFT. Prices include VAT."
+          : "The studio will contact you to arrange payment. Prices include VAT."}
+          Prints are printed after the school's order deadline and delivered to the school.</p>
+        <div id="confirm" class="confirm" hidden><b>Order received.</b> <span id="ordNum"></span></div>
       </div>
-      <div class="note">${cardPayments
-        ? "You'll pay securely by card or instant EFT through Yoco. Digital photographs are ready to download the moment payment goes through."
-        : "Payment is arranged with the studio directly. Digital photographs are ready to download as soon as payment is confirmed."}</div>`
-      }
+
+      <div class="basket" id="basket" hidden>
+        <span id="bcount">0 photos</span><span id="btotal" class="money">R0</span>
+        <a href="#summary" class="btn small">Review order</a>
+      </div>`}
+
+      <dialog class="lightbox" id="lb" aria-label="Photograph">
+        <img id="lbimg" alt="">
+        <div class="lbbar">
+          <button type="button" id="lbprev" aria-label="Previous">←</button>
+          ${isParent && canOrder ? `<button type="button" id="lbpick" class="btn small">Choose this photo</button>` : `<span></span>`}
+          <button type="button" id="lbnext" aria-label="Next">→</button>
+          <button type="button" id="lbclose" class="lbclose" aria-label="Close">✕</button>
+        </div>
+      </dialog>
+
       <script>
-        const picked=new Set();
-        document.querySelectorAll('.frame').forEach(f=>{
-          f.onclick=()=>{
-            const id=f.dataset.asset;
-            picked.has(id)?picked.delete(id):picked.add(id);
-            f.classList.toggle('picked');
-            update();
-          };
-        });
-        function selectedProducts(){
-          return [...document.querySelectorAll('.prod:checked')].map(el=>({
-            id:el.value, cents:Number(el.dataset.cents)
-          }));
-        }
-        function selectedPackages(){
-          return [...document.querySelectorAll('.pkg:checked')].map(el=>({
-            id:el.value, cents:Number(el.dataset.cents)
-          }));
-        }
-        function update(){
-          const pc=document.getElementById('pickCount');
-          if(pc) pc.textContent = picked.size + ' photograph(s) selected';
-          const prods=selectedProducts();
-          const pkgs=selectedPackages();
-          // Per-photo products multiply by the number of photographs chosen;
-          // a package is a fixed bundle and is charged once. These figures are
-          // for DISPLAY only — the server reprices everything from its own
-          // published price list before charging anything.
-          const total = prods.reduce((s,p)=>s+p.cents,0) * Math.max(1,picked.size)
-                      + pkgs.reduce((s,p)=>s+p.cents,0);
-          const totalEl=document.getElementById('total');
-          if(totalEl) totalEl.textContent='R'+(total/100).toFixed(2);
-          const btn=document.getElementById('place');
-          if(!btn) return;
-          const ready = picked.size>0 && (prods.length>0 || pkgs.length>0);
-          btn.disabled=!ready;
-          btn.textContent = ready ? 'Place order — R'+(total/100).toFixed(2)
-                                  : (picked.size===0 ? 'Select photographs to order'
-                                                     : 'Choose a package or product');
-        }
-        document.querySelectorAll('.prod,.pkg').forEach(el=>el.onchange=update);
+      ${FORMAT_RANDS_JS}
+      (function(){
+        const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+        const frames=$$('.frame'), picked=new Set();
+        const lb=$('#lb'); let cur=0;
 
-        const placeBtn=document.getElementById('place');
-        if(placeBtn){
-          placeBtn.onclick=async()=>{
-            const email=document.getElementById('email').value.trim();
-            const err=document.getElementById('emailErr');
-            if(!email.includes('@')){ err.textContent='Enter a valid email address.'; return; }
-            err.textContent='';
-            placeBtn.disabled=true; placeBtn.textContent='Placing order…';
-            const r=await fetch('/api/order',{
-              method:'POST', headers:{'Content-Type':'application/json'},
-              body:JSON.stringify({
-                childId:'${c.id}', email,
-                assetIds:[...picked], productIds:selectedProducts().map(p=>p.id),
-                packageIds:selectedPackages().map(p=>p.id)
-              })
-            });
-            const data=await r.json();
-            if(!r.ok){ err.textContent=data.message||'Something went wrong.'; placeBtn.disabled=false; update(); return; }
-            if(data.redirectUrl){ placeBtn.textContent='Taking you to secure payment…'; location.href=data.redirectUrl; return; }
-            if(data.orderPage){ location.href=data.orderPage; return; }
-            document.getElementById('ordNum').textContent='Order number: '+data.orderNumber;
-            document.getElementById('confirm').style.display='block';
-            placeBtn.style.display='none';
-          };
+        function show(i){ cur=(i+frames.length)%frames.length;
+          const f=frames[cur]; $('#lbimg').src=f.querySelector('img').src;
+          const b=$('#lbpick'); if(b){ const on=picked.has(f.dataset.asset);
+            b.textContent=on?'✓ Chosen — tap to remove':'Choose this photo'; b.classList.toggle('on',on); } }
+        frames.forEach((f,i)=>{
+          f.querySelector('.view').onclick=()=>{ show(i); lb.showModal(); };
+          const p=f.querySelector('.pick'); if(p) p.onclick=()=>toggle(f);
+        });
+        $('#lbprev').onclick=()=>show(cur-1); $('#lbnext').onclick=()=>show(cur+1);
+        $('#lbclose').onclick=()=>lb.close();
+        lb.addEventListener('click',e=>{ if(e.target===lb) lb.close(); });
+        document.addEventListener('keydown',e=>{ if(!lb.open) return;
+          if(e.key==='ArrowLeft') show(cur-1); if(e.key==='ArrowRight') show(cur+1); });
+        if($('#lbpick')) $('#lbpick').onclick=()=>{ toggle(frames[cur]); show(cur); };
+
+        function toggle(f){ const id=f.dataset.asset;
+          picked.has(id)?picked.delete(id):picked.add(id);
+          const on=picked.has(id); f.classList.toggle('picked',on);
+          const p=f.querySelector('.pick'); if(p){ p.setAttribute('aria-pressed',on); p.querySelector('.picklabel').textContent=on?'Chosen':'Choose'; }
+          update(); }
+
+        const place=$('#place'); if(!place) return;
+        function update(){
+          const n=picked.size, lines=[]; let total=0;
+          $$('.pkgchk:checked').forEach(el=>{ const c=+el.dataset.cents; total+=c;
+            lines.push([el.dataset.name+' package', c]); });
+          $$('.prod:checked').forEach(el=>{ const c=+el.dataset.cents;
+            if(el.dataset.once==='1'){ total+=c; lines.push([el.dataset.name,c]); }
+            else { total+=c*n; lines.push([el.dataset.name+' × '+n+' photo'+(n===1?'':'s'), c*n]); } });
+          $('#lines').innerHTML = lines.length
+            ? lines.map(l=>'<div class="line"><span>'+l[0].replace(/[&<>]/g,'')+'</span><span class="money">'+formatRands(l[1])+'</span></div>').join('')
+            : '<div class="hint">Choose photographs and at least one package or item.</div>';
+          $('#total').textContent=formatRands(total);
+          const ready=n>0 && lines.length>0;
+          place.disabled=!ready;
+          place.textContent= ready ? (${cardPayments ? "'Pay '" : "'Place order — '"}+formatRands(total))
+                           : n===0 ? 'Choose photographs to start' : 'Choose a package or item';
+          const b=$('#basket'); b.hidden = n===0 && lines.length===0;
+          $('#bcount').textContent = n+' photo'+(n===1?'':'s')+' chosen';
+          $('#btotal').textContent = formatRands(total);
         }
+        $$('.prod,.pkgchk').forEach(el=>el.onchange=update);
+
+        place.onclick=async()=>{
+          const email=$('#email').value.trim(), err=$('#err');
+          if(!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email)){ err.textContent='Please enter the email address for your receipt.'; $('#email').focus(); return; }
+          err.textContent=''; place.disabled=true; place.textContent='One moment…';
+          try{
+            const r=await fetch('/api/order',{method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({ childId:'${c.id}', email, assetIds:[...picked],
+                productIds:$$('.prod:checked').map(e=>e.value), packageIds:$$('.pkgchk:checked').map(e=>e.value) })});
+            const data=await r.json();
+            if(!r.ok){ err.textContent=data.message||'Something went wrong — please try again.'; update(); return; }
+            if(data.redirectUrl){ place.textContent='Taking you to secure payment…'; location.href=data.redirectUrl; return; }
+            if(data.orderPage){ location.href=data.orderPage; return; }
+            $('#ordNum').textContent='Order number '+data.orderNumber; $('#confirm').hidden=false; place.hidden=true;
+          }catch(e){ err.textContent='No connection — please try again.'; update(); }
+        };
+        update();
+      })();
       </script>`,
     }),
   );
@@ -931,7 +962,7 @@ app.post("/api/order", async (req, res) => {
     let subtotal = 0;
     const lines: Array<{
       kind: "product" | "package"; name: string; unitCents: number; qty: number;
-      assetId: string | null; isDigital: boolean;
+      assetId: string | null; isDigital: boolean; allAssets?: string[];
     }> = [];
 
     // Per-photo products: one line per photograph per product.
@@ -940,8 +971,24 @@ app.post("/api/order", async (req, res) => {
     // losing precision beyond 2^53), so `subtotal += p.amount_cents` silently
     // performs string concatenation — R145 + R485 became R14,500,485.00.
     // Caught by asserting an expected total rather than eyeballing the response.
+    // A full digital gallery is one price for ALL of this child's photos, not
+    // one charge per chosen photo (it was: 4 photos + gallery = 4 × R320).
+    // Its line carries every gallery asset so payment releases all of them.
+    const galleryProducts = priced.rows.filter((p) => p.kind === "digital_gallery");
+    const perPhotoProducts = priced.rows.filter((p) => p.kind !== "digital_gallery");
+    if (galleryProducts.length) {
+      const all = await client.query(
+        `select asset_id from gallery_item where child_id = $1 order by sort_order`, [childId],
+      );
+      for (const p of galleryProducts) {
+        const cents = Number(p.amount_cents);
+        lines.push({ kind: "product", name: p.name, unitCents: cents, qty: 1, assetId: null, isDigital: true,
+                     allAssets: all.rows.map((r) => r.asset_id as string) });
+        subtotal += cents;
+      }
+    }
     for (const assetId of assetIds) {
-      for (const p of priced.rows) {
+      for (const p of perPhotoProducts) {
         const cents = Number(p.amount_cents);
         lines.push({
           kind: "product", name: p.name, unitCents: cents, qty: 1, assetId,
@@ -989,7 +1036,8 @@ app.post("/api/order", async (req, res) => {
           studioId, orderId, childId, lineNo++, l.qty, l.unitCents, l.unitCents * l.qty,
           // The snapshot is what makes an old order reconstructible even after
           // the catalogue changes (§11.1) — so it records the whole selection.
-          JSON.stringify({ name: l.name, assetId: l.assetId, assetIds: l.kind === "package" ? assetIds : undefined }),
+          JSON.stringify({ name: l.name, assetId: l.assetId,
+                           assetIds: l.allAssets ?? (l.kind === "package" ? assetIds : undefined) }),
           l.isDigital ? "digital" : "physical",
           l.kind,
         ],
@@ -1077,18 +1125,17 @@ app.get("/order/:orderNumber", async (req, res) => {
   else status = `Awaiting payment. The studio will be in touch to arrange it.`;
 
   const lineRows = data.lines
-    .map((l: any) => `<div class="prow"><span>${escapeHtml(l.name ?? l.kind)}</span>
-        <span class="mono" style="font-size:11px;color:var(--silver)">${l.fulfilment_kind === "digital" ? "digital" : "print"}</span>
-        <span class="pmoney">R${(Number(l.line_total_cents) / 100).toFixed(2)}</span></div>`)
+    .map((l: any) => `<div class="line"><span>${escapeHtml(l.name ?? l.kind)}
+        <small class="kind">${l.kind === "package" ? "package" : l.fulfilment_kind === "digital" ? "digital download" : "printed &amp; delivered to school"}</small></span>
+        <span class="money">${formatRands(l.line_total_cents)}</span></div>`)
     .join("");
 
   const downloads = data.grants.length
     ? `<div class="sectlabel"><span>Your digital photographs</span></div>
-       <div class="sheet">${data.grants
-         .map((g: any) => `<div class="frame">
-             ${g.thumb ? `<img src="${publicUrl(g.thumb)}" alt="">` : ""}
-             <a class="btn" style="display:block;text-align:center;margin-top:6px;padding:8px"
-                href="/download/${g.id}">Download</a></div>`)
+       <div class="gallery">${data.grants
+         .map((g: any, i: number) => `<figure class="frame">
+             ${g.thumb ? `<img src="${publicUrl(g.thumb)}" alt="Photograph ${i + 1}">` : ""}
+             <a class="pick" href="/download/${g.id}" download>Download</a></figure>`)
          .join("")}</div>
        <div class="note">Full-resolution files without watermark. Each link works on this device for a year.</div>`
     : paid && o.digital_status === "none"
@@ -1100,14 +1147,17 @@ app.get("/order/:orderNumber", async (req, res) => {
     nav: PARENT_NAV,
     body: `
     ${awaitingWebhook ? `<meta http-equiv="refresh" content="3;url=/order/${o.order_number}?poll=${polls + 1}">` : ""}
-    <div class="sheet-head"><div class="kid"><h1>Order ${escapeHtml(o.order_number)}</h1>
-      <span class="cls">${escapeHtml(o.contact_email ?? "")}</span></div></div>
-    <div class="order-panel" style="background:#fff;border:1px solid var(--rule);border-radius:4px;padding:16px">
-      <p style="margin-bottom:10px">${status}</p>
-      ${lineRows}
-      <div class="prow" style="font-weight:600"><span>Total</span><span class="pmoney">R${(Number(o.total_cents) / 100).toFixed(2)}</span></div>
+    <section class="hero">
+      <p class="eyebrow">Order ${escapeHtml(o.order_number)}${o.contact_email ? " · receipt to " + escapeHtml(o.contact_email) : ""}</p>
+      <h1>${paid ? "Thank you" : "Your order"}</h1>
+    </section>
+    <div class="summary">
+      <p class="status ${paid ? "ok" : ""}">${status}</p>
+      <div class="lines">${lineRows}</div>
+      <div class="totalrow"><span>Total</span><span class="money">${formatRands(o.total_cents)}</span></div>
       ${canPay && !awaitingWebhook
-        ? `<form method="post" action="/order/${o.order_number}/pay"><button class="btn" type="submit">Pay R${(Number(o.total_cents) / 100).toFixed(2)} now</button></form>`
+        ? `<form method="post" action="/order/${o.order_number}/pay"><button class="btn" type="submit">Pay ${formatRands(o.total_cents)} securely</button></form>
+           <p class="fine">Card or instant EFT on Yoco's secure page. Prices include VAT.</p>`
         : ""}
     </div>
     ${downloads}
@@ -1216,6 +1266,11 @@ app.get("/admin", async (req, res) => {
     }));
   }
 
+  const notice = req.query.saved
+    ? { ok: true, text: String(req.query.saved) }
+    : req.query.error
+    ? { ok: false, text: String(req.query.error) }
+    : null;
   const selectedId = (req.query.school as string) || schools.rows[0].id;
   const selected = schools.rows.find((s) => s.id === selectedId) ?? schools.rows[0];
 
@@ -1256,11 +1311,19 @@ app.get("/admin", async (req, res) => {
       );
 
   const products = await pool.query(
-    `select id, sku, name_i18n->>'en' as name, active from product where studio_id = $1 order by sku`,
+    `select id, sku, name_i18n->>'en' as name, kind, active from product where studio_id = $1
+      order by active desc, name_i18n->>'en'`,
     [studioId],
   );
   const packages = await pool.query(
-    `select id, name_i18n->>'en' as name, active from package where studio_id = $1 order by name_i18n->>'en'`,
+    `select pk.id, pk.name_i18n->>'en' as name, pk.description_i18n->>'en' as description, pk.active,
+            (select pr.amount_cents from price pr join price_list pl on pl.id = pr.price_list_id
+              where pr.package_id = pk.id and pl.status = 'published'
+              order by pl.effective_from desc limit 1) as amount_cents,
+            coalesce((select jsonb_object_agg(pi.product_id, pi.quantity) from package_item pi
+                       where pi.package_id = pk.id), '{}'::jsonb) as items
+       from package pk where pk.studio_id = $1
+      order by pk.active desc, pk.sort_order, pk.name_i18n->>'en'`,
     [studioId],
   );
   const priceList = await pool.query(
@@ -1324,38 +1387,52 @@ app.get("/admin", async (req, res) => {
         <button type="submit" class="btn" style="max-width:160px">Save school</button>
       </form>
 
-      <div class="sectlabel"><span>Products &amp; prices</span></div>
-      <table><thead><tr><th>SKU</th><th>Name</th><th>Price (cents)</th><th>Active</th><th></th></tr></thead><tbody>
+      ${notice ? `<div class="flash ${notice.ok ? "ok" : ""}">${escapeHtml(notice.text)}</div>` : ""}
+      <div class="sectlabel" id="products"><span>Products &amp; prices</span></div>
+      <p class="hint">Prices are in Rands, VAT included — type <b>145</b> or <b>145,50</b>. Per-photo items are
+        charged once for every photograph the parent picks.</p>
+      ${products.rows
+        .map((p) => `<form id="p-${p.id}" method="post" action="/admin/product/${p.id}"></form>`)
+        .join("")}
+      <div class="tablewrap"><table class="edit"><thead><tr><th>Product</th><th>Type</th><th>Price</th><th>On sale</th><th></th></tr></thead><tbody>
         ${products.rows
           .map(
-            (p) => `<tr><form method="post" action="/admin/product/${p.id}">
-              <td class="mono">${escapeHtml(p.sku)}</td>
-              <td><input name="name" value="${escapeHtml(p.name)}" style="border:1px solid var(--rule);padding:5px;border-radius:2px;width:100%"></td>
-              <td><input name="amount_cents" type="number" value="${priceByProduct.get(p.id) ?? 0}"
-                    style="border:1px solid var(--rule);padding:5px;border-radius:2px;width:100px"></td>
-              <td><input type="checkbox" name="active" ${p.active ? "checked" : ""}></td>
-              <td><button type="submit" class="pill">Save</button></td>
-            </form></tr>`,
+            (p) => `<tr class="${p.active ? "" : "off"}">
+              <td><input form="p-${p.id}" name="name" value="${escapeHtml(p.name)}" required aria-label="Product name">
+                  <div class="sku">${escapeHtml(p.sku)}</div></td>
+              <td><span class="pill">${escapeHtml(KIND_LABEL[p.kind] ?? p.kind)}</span></td>
+              <td><label class="rands"><span>R</span><input form="p-${p.id}" name="price" inputmode="decimal"
+                    value="${randsInputValue(priceByProduct.get(p.id))}" required aria-label="Price in Rands"></label></td>
+              <td><input form="p-${p.id}" type="checkbox" name="active" ${p.active ? "checked" : ""} aria-label="On sale"></td>
+              <td><button form="p-${p.id}" type="submit" class="pill">Save</button></td>
+            </tr>`,
           )
           .join("")}
-      </tbody></table>
-      <form method="post" action="/admin/product" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
-        <input name="sku" placeholder="SKU e.g. PRINT-A4" required style="padding:8px;border:1px solid var(--rule);border-radius:2px">
-        <input name="name" placeholder="Name e.g. A4 Print" required style="padding:8px;border:1px solid var(--rule);border-radius:2px">
-        <input name="amount_cents" type="number" placeholder="Price in cents" required style="padding:8px;border:1px solid var(--rule);border-radius:2px;width:130px">
-        <button type="submit" class="btn" style="width:auto;padding:8px 16px">Add product</button>
+      </tbody></table></div>
+      <form method="post" action="/admin/product" class="addrow">
+        <input name="name" placeholder="New product, e.g. A4 Print" required>
+        <select name="kind" aria-label="Type">
+          <option value="print">Print (per photo)</option>
+          <option value="merch">Gift / merchandise (per photo)</option>
+          <option value="digital_single">Digital image (per photo)</option>
+          <option value="digital_gallery">Full digital gallery</option>
+        </select>
+        <label class="rands"><span>R</span><input name="price" inputmode="decimal" placeholder="145" required aria-label="Price in Rands"></label>
+        <button type="submit" class="btn small">Add product</button>
       </form>
 
-      <div class="sectlabel"><span>Packages</span></div>
-      <table><thead><tr><th>Name</th><th>Active</th></tr></thead><tbody>
-        ${packages.rows.length
-          ? packages.rows.map((p) => `<tr><td>${escapeHtml(p.name)}</td><td><span class="pill ${p.active ? "ok" : ""}">${p.active ? "Active" : "Draft"}</span></td></tr>`).join("")
-          : `<tr><td colspan="2" class="empty">No packages yet.</td></tr>`}
-      </tbody></table>
-      <form method="post" action="/admin/package" style="margin-top:8px;display:flex;gap:6px">
-        <input name="name" placeholder="Package name e.g. Silver" required style="padding:8px;border:1px solid var(--rule);border-radius:2px">
-        <button type="submit" class="btn" style="width:auto;padding:8px 16px">Add package</button>
-      </form>
+      <div class="sectlabel" id="packages"><span>Packages</span></div>
+      <p class="hint">A package is one price for a bundle. Tick what's in it — digital items are released to
+        the parent the moment they pay. Packages that are off are hidden from parents.</p>
+      ${packages.rows.length ? packages.rows.map((pk) => packageEditor(pk, products.rows)).join("") : `<div class="empty">No packages yet.</div>`}
+      <details class="newpkg"><summary class="btn small">+ New package</summary>
+        <form method="post" action="/admin/package" class="pkgform">
+          <label>Name<input name="name" placeholder="e.g. Platinum" required></label>
+          <label>Price<span class="rands"><span>R</span><input name="price" inputmode="decimal" placeholder="1 200" required></span></label>
+          <label class="wide">What parents read<input name="description" placeholder="e.g. Everything in Gold plus an A3 print"></label>
+          <button type="submit" class="btn small">Create package</button>
+        </form>
+      </details>
 
       <div class="sectlabel"><span>Orders</span></div>
       ${
@@ -1368,7 +1445,7 @@ app.get("/admin", async (req, res) => {
               (o) => `<tr>
                 <td class="mono">${escapeHtml(o.order_number)}</td>
                 <td>${escapeHtml(o.email)}</td>
-                <td class="mono">R${(o.total_cents / 100).toFixed(2)}</td>
+                <td class="mono">${formatRands(o.total_cents)}</td>
                 <td><span class="pill ${o.payment_status === "settled" ? "ok" : ""}">${escapeHtml(o.payment_status)}</span></td>
                 <td><span class="pill ${o.digital_status === "delivered" ? "ok" : ""}">${escapeHtml(o.digital_status)}</span></td>
                 <td><span class="pill ${o.fulfilment_status === "completed" ? "ok" : ""}">${escapeHtml(o.fulfilment_status)}</span></td>
@@ -1453,39 +1530,98 @@ app.post("/admin/school/:id", async (req, res) => {
   res.redirect(`/admin?school=${req.params.id}`);
 });
 
+const KIND_LABEL: Record<string, string> = {
+  print: "Print",
+  merch: "Gift",
+  digital_single: "Digital",
+  digital_gallery: "Digital gallery",
+};
+
+function packageEditor(pk: any, products: any[]): string {
+  const items = (pk.items ?? {}) as Record<string, number>;
+  const rows = products
+    .filter((p) => p.active || items[p.id])
+    .map(
+      (p) => `<label class="pkgitem"><input type="number" name="qty_${p.id}" min="0" max="99"
+          value="${items[p.id] ?? 0}" inputmode="numeric" aria-label="Quantity of ${escapeHtml(p.name)}">
+        <span>${escapeHtml(p.name)}</span></label>`,
+    )
+    .join("");
+  return `<form method="post" action="/admin/package/${pk.id}" class="pkgcard ${pk.active ? "" : "off"}">
+    <div class="pkgform">
+      <label>Name<input name="name" value="${escapeHtml(pk.name)}" required></label>
+      <label>Price<span class="rands"><span>R</span><input name="price" inputmode="decimal"
+        value="${randsInputValue(pk.amount_cents)}" required></span></label>
+      <label class="wide">What parents read<input name="description" value="${escapeHtml(pk.description ?? "")}"
+        placeholder="Left empty, this is written from the contents below"></label>
+    </div>
+    <div class="pkglabel">Contents <span>— how many of each</span></div>
+    <div class="pkgitems">${rows}</div>
+    <div class="pkgfoot">
+      <label class="toggle"><input type="checkbox" name="active" ${pk.active ? "checked" : ""}> Offered to parents</label>
+      <button type="submit" class="btn small">Save package</button>
+    </div>
+  </form>`;
+}
+
+/** Back to the admin section the form came from, with a message. */
+function backTo(res: express.Response, anchor: string, msg: { saved?: string; error?: string }) {
+  const q = msg.error ? `error=${encodeURIComponent(msg.error)}` : `saved=${encodeURIComponent(msg.saved ?? "Saved.")}`;
+  res.redirect(303, `/admin?${q}#${anchor}`);
+}
+
+const BAD_PRICE = "That price wasn't understood. Type it in Rands, like 145 or 145,50.";
+
 app.post("/admin/product", async (req, res) => {
   const { studioId } = await ensureStudioAndStaff();
-  const { sku, name, amount_cents } = req.body;
-  try {
-    const p = await pool.query(
-      `insert into product (studio_id, sku, name_i18n, kind, active)
-       values ($1, $2, jsonb_build_object('en', $3::text), 'print', true)
-       returning id`,
-      [studioId, sku, name],
-    );
-    await ensurePriceListAndSet(studioId, p.rows[0].id, Number(amount_cents));
-  } catch (err) {
-    // A duplicate SKU is a mistake worth a plain message, not a stack trace.
-    const msg = (err as Error).message.includes("product_sku_unique")
-      ? `A product with SKU "${sku}" already exists — edit it in the table above instead.`
-      : (err as Error).message;
-    return res.status(400).send(msg + `<br><a href="/admin">← Back</a>`);
+  const name = String(req.body.name ?? "").trim();
+  const kind = String(req.body.kind ?? "print");
+  const cents = parseRands(req.body.price);
+  if (!name) return backTo(res, "products", { error: "Give the product a name." });
+  if (!KIND_LABEL[kind]) return backTo(res, "products", { error: "Unknown product type." });
+  if (cents === null) return backTo(res, "products", { error: BAD_PRICE });
+
+  // The SKU is an internal reference nobody should have to invent; derive a
+  // unique one from the name.
+  const base = name.toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30) || "PRODUCT";
+  let sku = base;
+  for (let i = 2; (await pool.query(`select 1 from product where studio_id = $1 and sku = $2`, [studioId, sku])).rowCount; i++) {
+    sku = `${base}-${i}`;
   }
-  res.redirect("/admin");
+  const p = await pool.query(
+    `insert into product (studio_id, sku, name_i18n, kind, active)
+     values ($1, $2, jsonb_build_object('en', $3::text), $4, true) returning id`,
+    [studioId, sku, name, kind],
+  );
+  await setPrice(studioId, { productId: p.rows[0].id }, cents);
+  backTo(res, "products", { saved: `${name} added at ${formatRands(cents)}.` });
 });
 
 app.post("/admin/product/:id", async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return backTo(res, "products", { error: "Unknown product." });
   const { studioId } = await ensureStudioAndStaff();
-  const { name, amount_cents, active } = req.body;
+  const name = String(req.body.name ?? "").trim();
+  const cents = parseRands(req.body.price);
+  if (!name) return backTo(res, "products", { error: "A product needs a name." });
+  if (cents === null) return backTo(res, "products", { error: BAD_PRICE });
   await pool.query(
-    `update product set name_i18n = jsonb_build_object('en', $1::text), active = $2 where id = $3`,
-    [name, active === "on", req.params.id],
+    `update product set name_i18n = jsonb_build_object('en', $1::text), active = $2 where id = $3 and studio_id = $4`,
+    [name, req.body.active === "on", req.params.id, studioId],
   );
-  await ensurePriceListAndSet(studioId, req.params.id, Number(amount_cents));
-  res.redirect("/admin");
+  await setPrice(studioId, { productId: req.params.id }, cents);
+  backTo(res, "products", { saved: `${name} saved — ${formatRands(cents)}${req.body.active === "on" ? "" : ", not on sale"}.` });
 });
 
-async function ensurePriceListAndSet(studioId: string, productId: string, amountCents: number) {
+/**
+ * Set the current published price of a product or package.
+ *
+ * Updates the published list in place rather than versioning a new list per
+ * edit. Safe for orders already placed: every order line stores its own
+ * unit_cents and name snapshot at the moment of ordering, so an edit here
+ * never changes what an existing order cost.
+ */
+async function setPrice(studioId: string, target: { productId: string } | { packageId: string }, amountCents: number) {
   let pl = await pool.query(
     `select id from price_list where studio_id = $1 and status = 'published' order by effective_from desc limit 1`,
     [studioId],
@@ -1499,33 +1635,83 @@ async function ensurePriceListAndSet(studioId: string, productId: string, amount
     );
     priceListId = created.rows[0].id;
   }
-  await pool.query(
-    `insert into price (studio_id, price_list_id, product_id, amount_cents)
-     values ($1, $2, $3, $4)
-     on conflict do nothing`,
-    [studioId, priceListId, productId, amountCents],
+  const col = "productId" in target ? "product_id" : "package_id";
+  const id = "productId" in target ? target.productId : target.packageId;
+  const upd = await pool.query(
+    `update price set amount_cents = $1 where price_list_id = $2 and ${col} = $3`,
+    [amountCents, priceListId, id],
   );
-  // Simplification, stated plainly: this UPDATEs in place rather than
-  // versioning a new price_list per edit (§11.1 describes full versioning).
-  // Acceptable for now because no checkout exists yet to reference historical
-  // order-line snapshots — there is nothing yet for an old price to protect.
-  // Revisit before checkout ships, or an edited price will retroactively
-  // change what a placed order appears to have cost.
-  await pool.query(
-    `update price set amount_cents = $1 where price_list_id = $2 and product_id = $3`,
-    [amountCents, priceListId, productId],
+  if (upd.rowCount === 0) {
+    await pool.query(
+      `insert into price (studio_id, price_list_id, ${col}, amount_cents) values ($1, $2, $3, $4)`,
+      [studioId, priceListId, id, amountCents],
+    );
+  }
+}
+
+/** Plain-English contents, used when Wiaan leaves the description empty. */
+async function describeContents(packageId: string): Promise<string> {
+  const r = await pool.query(
+    `select pi.quantity, p.name_i18n->>'en' as name from package_item pi join product p on p.id = pi.product_id
+      where pi.package_id = $1 order by pi.sort_order`,
+    [packageId],
   );
+  return r.rows.map((x) => (x.quantity > 1 ? `${x.quantity} × ${x.name}` : x.name)).join(", ");
+}
+
+async function savePackageContents(studioId: string, packageId: string, body: Record<string, unknown>) {
+  const products = await pool.query(`select id from product where studio_id = $1`, [studioId]);
+  await pool.query(`delete from package_item where package_id = $1`, [packageId]);
+  let order = 0;
+  for (const p of products.rows) {
+    const raw = body[`qty_${p.id}`];
+    const qty = Math.min(99, Math.max(0, Math.floor(Number(raw ?? 0)) || 0));
+    if (qty > 0) {
+      await pool.query(
+        `insert into package_item (studio_id, package_id, product_id, quantity, sort_order) values ($1, $2, $3, $4, $5)`,
+        [studioId, packageId, p.id, qty, order++],
+      );
+    }
+  }
 }
 
 app.post("/admin/package", async (req, res) => {
   const { studioId } = await ensureStudioAndStaff();
-  const { name } = req.body;
-  await pool.query(
-    `insert into package (studio_id, name_i18n, description_i18n, active)
-     values ($1, jsonb_build_object('en', $2::text), '{}'::jsonb, false)`,
-    [studioId, name],
+  const name = String(req.body.name ?? "").trim();
+  const cents = parseRands(req.body.price);
+  if (!name) return backTo(res, "packages", { error: "Give the package a name." });
+  if (cents === null) return backTo(res, "packages", { error: BAD_PRICE });
+  const r = await pool.query(
+    `insert into package (studio_id, name_i18n, description_i18n, active, sort_order)
+     values ($1, jsonb_build_object('en', $2::text), jsonb_build_object('en', $3::text), false,
+             coalesce((select max(sort_order) + 1 from package where studio_id = $1), 0))
+     returning id`,
+    [studioId, name, String(req.body.description ?? "").trim()],
   );
-  res.redirect("/admin");
+  await setPrice(studioId, { packageId: r.rows[0].id }, cents);
+  backTo(res, "packages", { saved: `${name} created. Tick what's in it, switch it on, and save.` });
+});
+
+app.post("/admin/package/:id", async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return backTo(res, "packages", { error: "Unknown package." });
+  const { studioId } = await ensureStudioAndStaff();
+  const name = String(req.body.name ?? "").trim();
+  const cents = parseRands(req.body.price);
+  if (!name) return backTo(res, "packages", { error: "A package needs a name." });
+  if (cents === null) return backTo(res, "packages", { error: BAD_PRICE });
+  const owned = await pool.query(`select 1 from package where id = $1 and studio_id = $2`, [req.params.id, studioId]);
+  if (owned.rowCount === 0) return backTo(res, "packages", { error: "Unknown package." });
+
+  await savePackageContents(studioId, req.params.id, req.body);
+  const description = String(req.body.description ?? "").trim() || (await describeContents(req.params.id));
+  await pool.query(
+    `update package set name_i18n = jsonb_build_object('en', $1::text),
+                        description_i18n = jsonb_build_object('en', $2::text), active = $3
+      where id = $4`,
+    [name, description, req.body.active === "on", req.params.id],
+  );
+  await setPrice(studioId, { packageId: req.params.id }, cents);
+  backTo(res, "packages", { saved: `${name} saved — ${formatRands(cents)}${req.body.active === "on" ? "" : ", hidden from parents"}.` });
 });
 
 // ── Printable claim-code sheet, with real QR codes ───────────────────────────
@@ -1694,19 +1880,8 @@ app.post("/api/import/upload", upload.array("files"), async (req, res) => {
       if (match) {
         const first = match.firstName;
         const last = match.lastName || "—";
-        let existingChild = await pool.query(
-          `select id from child where studio_id = $1 and school_id = $2
-             and first_name = $3 and last_name = $4 and status = 'active'`,
-          [studioId, school.id, first, last],
-        );
-        let childId = existingChild.rows[0]?.id as string | undefined;
-        if (!childId) {
-          const r = await pool.query(
-            `insert into child (studio_id, school_id, first_name, last_name) values ($1,$2,$3,$4) returning id`,
-            [studioId, school.id, first, last],
-          );
-          childId = r.rows[0].id;
-        }
+        const childId = await findOrCreateChild(studioId, school.id, first, last);
+        await ensureEnrolment(studioId, school.id, childId, inner[0]!, inner[1]!);
         TAG_MAP.set(fileId, childId!);
         autoMatchedName = `${first} ${last}`.trim();
         await pool.query(`update import_file set status = 'processed' where id = $1`, [fileId]);
@@ -1728,6 +1903,55 @@ app.post("/api/import/upload", upload.array("files"), async (req, res) => {
     res.status(500).json({ error: (err as Error).message });
   }
 });
+
+/**
+ * Same child if the full name matches ignoring accents, case and spacing —
+ * so re-importing "Zané du Toit" finds the "Zane Du Toit" an older import
+ * created, instead of making a second child with a second gallery.
+ */
+async function findOrCreateChild(studioId: string, schoolId: string, first: string, last: string): Promise<string> {
+  const existing = await pool.query(
+    `select id from child where studio_id = $1 and school_id = $2 and status = 'active'
+        and regexp_replace(lower(app.immutable_unaccent(first_name || ' ' || last_name)), '\\s+', ' ', 'g')
+          = regexp_replace(lower(app.immutable_unaccent($3 || ' ' || $4)), '\\s+', ' ', 'g')
+      order by created_at limit 1`,
+    [studioId, schoolId, first, last],
+  );
+  if (existing.rows[0]) return existing.rows[0].id;
+  const r = await pool.query(
+    `insert into child (studio_id, school_id, first_name, last_name) values ($1,$2,$3,$4) returning id`,
+    [studioId, schoolId, first, last],
+  );
+  return r.rows[0].id;
+}
+
+/**
+ * Record grade and class from the folder path. Imports never did, so the
+ * gallery, the claim cards and the admin could not say which class a child
+ * was in. Unrecognisable folder names are skipped rather than guessed.
+ */
+async function ensureEnrolment(studioId: string, schoolId: string, childId: string, gradeRaw: string, classRaw: string) {
+  const g = parseGrade(gradeRaw);
+  const k = parseClass(classRaw);
+  if (!g || !k) return;
+  const year = new Date().getFullYear();
+  const sort = g.level === "RR" ? -2 : g.level === "R" ? -1 : Number(g.level) || 0;
+  const grade = await pool.query(
+    `insert into grade (studio_id, school_id, name, name_norm, sort_order) values ($1,$2,$3,$4,$5)
+     on conflict (school_id, name_norm) do update set name = grade.name returning id`,
+    [studioId, schoolId, g.canonical, g.level.toLowerCase(), sort],
+  );
+  const klass = await pool.query(
+    `insert into class_group (studio_id, school_id, grade_id, name, name_norm, academic_year) values ($1,$2,$3,$4,$5,$6)
+     on conflict (school_id, grade_id, name_norm, academic_year) do update set name = class_group.name returning id`,
+    [studioId, schoolId, grade.rows[0].id, k.canonical, compactName(k.canonical), year],
+  );
+  await pool.query(
+    `insert into enrolment (studio_id, child_id, class_group_id, academic_year) values ($1,$2,$3,$4)
+     on conflict (child_id, academic_year) do update set class_group_id = excluded.class_group_id`,
+    [studioId, childId, klass.rows[0].id, year],
+  );
+}
 
 const STAGED_KEYS = new Map<
   string,
@@ -1778,19 +2002,7 @@ app.post("/api/import/:batchId/tag", async (req, res) => {
     if (info.rowCount === 0) return res.status(404).json({ error: "Unknown file." });
     const { studio_id: studioId, school_id: schoolId } = info.rows[0];
 
-    let child = await pool.query(
-      `select id from child where studio_id = $1 and school_id = $2
-        and first_name = $3 and last_name = $4 and status = 'active'`,
-      [studioId, schoolId, firstName, lastName],
-    );
-    let childId = child.rows[0]?.id as string | undefined;
-    if (!childId) {
-      const r = await pool.query(
-        `insert into child (studio_id, school_id, first_name, last_name) values ($1,$2,$3,$4) returning id`,
-        [studioId, schoolId, firstName, lastName],
-      );
-      childId = r.rows[0].id;
-    }
+    const childId = await findOrCreateChild(studioId, schoolId, firstName, lastName);
 
     await pool.query(`update import_file set status = 'processed' where id = $1`, [fileId]);
     TAG_MAP.set(fileId, childId!);

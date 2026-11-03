@@ -55,7 +55,7 @@ export function parseChildFolder(rawSegment: string): ParsedChildFolder | null {
   // Bare digits ("2024", "01") are never a child's name.
   if (words.every((w) => /^\d+$/.test(w))) return null;
 
-  const titled = words.map((w) => w.charAt(0).toUpperCase() + w.slice(1));
+  const titled = displayWords(trimmed, words);
 
   if (titled.length === 1) {
     // A single word is ambiguous — could be a first name, could be a class
@@ -64,16 +64,40 @@ export function parseChildFolder(rawSegment: string): ParsedChildFolder | null {
     return { firstName: titled[0]!, lastName: "", rawFolderName: trimmed };
   }
 
-  // "Firstname Lastname" is the overwhelmingly common shape. For three or
-  // four words ("Anna Marie Van Der Merwe"), the LAST word is the surname
-  // and everything before it is the given name — matching how South African
-  // double-barrelled surnames are almost never the pattern (compound GIVEN
-  // names are common; "Van Der Merwe" as a folder name would be unusual
-  // without a first name attached, and if it happens, it still resolves to
-  // *some* surname, which is recoverable in the review screen).
-  const lastName = titled[titled.length - 1]!;
-  const firstName = titled.slice(0, -1).join(" ");
+  // The surname starts at the first surname particle ("van", "du", "le" …)
+  // after the given name, otherwise it is the last word. "Zané du Toit" is
+  // Zané / du Toit, "Anna Marie van Merwe" is Anna Marie / van Merwe, and
+  // "Noah Botha" is Noah / Botha.
+  let split = titled.length - 1;
+  for (let i = 1; i < titled.length - 1; i++) {
+    if (SURNAME_PARTICLES.has(words[i]!)) { split = i; break; }
+  }
+  const firstName = titled.slice(0, split).join(" ");
+  const lastName = titled.slice(split).join(" ");
   return { firstName, lastName, rawFolderName: trimmed };
+}
+
+const SURNAME_PARTICLES = new Set(["van", "von", "du", "de", "der", "den", "le", "la", "ter", "ten"]);
+
+/**
+ * The words to STORE and SHOW, as opposed to the normalised words used for
+ * matching. Accents survive (Zané, not Zane) and the photographer's own
+ * capitalisation is kept ("du Toit", not "Du Toit"). Only a folder typed all
+ * in one case gets title-cased. If the raw text doesn't line up word-for-word
+ * with the normalised form (noise like "(2)" or "final" was stripped), fall
+ * back to title-casing the normalised words.
+ */
+function displayWords(raw: string, normWords: string[]): string[] {
+  const rawWords = raw.replace(/[_.]+/g, " ").trim().split(/\s+/).filter(Boolean);
+  const plain = (w: string) => w.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const aligned = rawWords.length === normWords.length && rawWords.every((w, i) => plain(w) === normWords[i]);
+  if (!aligned) return normWords.map((w) => w.charAt(0).toUpperCase() + w.slice(1));
+
+  const letters = raw.replace(/[^\p{L}]/gu, "");
+  const oneCase = letters === letters.toLowerCase() || letters === letters.toUpperCase();
+  return oneCase
+    ? rawWords.map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    : rawWords;
 }
 
 /**

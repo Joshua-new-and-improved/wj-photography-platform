@@ -10,7 +10,7 @@ describe("parsing a child's name from their folder", () => {
 
   it("handles a compound given name with the surname last", () => {
     expect(parseChildFolder("Anna Marie van Merwe")).toEqual({
-      firstName: "Anna Marie Van", lastName: "Merwe",
+      firstName: "Anna Marie", lastName: "van Merwe",
       rawFolderName: "Anna Marie van Merwe",
     });
   });
@@ -32,6 +32,23 @@ describe("parsing a child's name from their folder", () => {
   it("strips diacritics for matching but the review screen keeps the raw text", () => {
     const r = parseChildFolder("Zané Pretorius");
     expect(r?.rawFolderName).toBe("Zané Pretorius");
+  });
+
+  it("keeps accents and the photographer's capitalisation in the stored name", () => {
+    expect(parseChildFolder("Zané Pretorius")).toMatchObject({ firstName: "Zané", lastName: "Pretorius" });
+    expect(parseChildFolder("Zané du Toit")).toMatchObject({ firstName: "Zané", lastName: "du Toit" });
+    expect(parseChildFolder("Liam le Roux")).toMatchObject({ firstName: "Liam", lastName: "le Roux" });
+    expect(parseChildFolder("Mia van der Walt")).toMatchObject({ firstName: "Mia", lastName: "van der Walt" });
+  });
+
+  it("title-cases a folder typed all in one case", () => {
+    expect(parseChildFolder("noah botha")).toMatchObject({ firstName: "Noah", lastName: "Botha" });
+    expect(parseChildFolder("NOAH BOTHA")).toMatchObject({ firstName: "Noah", lastName: "Botha" });
+    expect(parseChildFolder("anél du plessis")).toMatchObject({ firstName: "Anél", lastName: "Du Plessis" });
+  });
+
+  it("falls back to the normalised words when noise was stripped", () => {
+    expect(parseChildFolder("Noah Botha (2)")).toMatchObject({ firstName: "Noah", lastName: "Botha" });
   });
 
   it("refuses operational folders rather than inventing a child called them", () => {
