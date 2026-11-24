@@ -1,4 +1,4 @@
-import { normaliseFolderName, isIgnorableName } from "./folders.js";
+import { normaliseFolderName, isIgnorableName, parseGrade, parseClass } from "./folders.js";
 
 /**
  * Match a photograph to a child by the folder it sits in.
@@ -29,6 +29,31 @@ export interface ParsedChildFolder {
   /** The exact folder text, kept for the review screen and for re-matching
    *  photographs added to the same folder later in the same shoot. */
   rawFolderName: string;
+  /** Parent email addresses written into the folder name, e.g.
+   *  "1. Ioannis parent@example.com". Lower-cased, de-duplicated. */
+  emails?: string[];
+}
+
+const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,}/gi;
+
+/**
+ * Take the parts of a child's folder name that are not the name: a list
+ * number in front ("1.", "01 -", "3)", "#4") and any email addresses
+ * (the parent's contact, which the studio writes next to the name).
+ */
+export function splitChildFolder(raw: string): { name: string; emails: string[] } {
+  const emails = [...new Set((raw.match(EMAIL_RE) ?? []).map((e) => e.toLowerCase()))];
+  const name = raw
+    .replace(EMAIL_RE, " ")
+    .replace(/^\s*#?\d{1,4}\s*[.)\-:_]?\s+/, "")   // "1. ", "01 - ", "3) ", "#4 "
+    .replace(/^\s*#?\d{1,4}[.)_-]+/, "")              // "1.Name", "02_Name"
+    .replace(/\(\s*\d+\s*\)/g, " ")                 // "(2)" copy markers
+    .replace(/[(<\[]\s*[)>\]]/g, " ")                 // brackets the email sat in
+    .replace(/[<>\[\],;|]+/g, " ")
+    .replace(/\s[-–—:]\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return { name, emails };
 }
 
 const NON_NAME_WORDS = new Set([
@@ -39,7 +64,15 @@ const NON_NAME_WORDS = new Set([
 ]);
 
 export function parseChildFolder(rawSegment: string): ParsedChildFolder | null {
-  const trimmed = rawSegment.trim();
+  if (!rawSegment.trim()) return null;
+  if (/^[_#~]/.test(rawSegment.trim()) && !/^#\d/.test(rawSegment.trim())) return null;
+  const { name: trimmed, emails } = splitChildFolder(rawSegment);
+  const parsed = parseName(trimmed);
+  if (!parsed) return null;
+  return { ...parsed, rawFolderName: rawSegment.trim(), ...(emails.length ? { emails } : {}) };
+}
+
+function parseName(trimmed: string): ParsedChildFolder | null {
   if (!trimmed) return null;
   if (isIgnorableName(trimmed)) return null;
   // A leading underscore/hash/tilde means "not a class or a child" by the same
@@ -108,8 +141,49 @@ function displayWords(raw: string, normWords: string[]): string[] {
  * root, or a folder that does not parse as a name — so the caller can fall
  * back to manual tagging exactly as before.
  */
-export function childFolderFromPath(innerSegments: string[]): ParsedChildFolder | null {
-  // grade / class / child / file.jpg  → 3 folder segments before the file.
-  if (innerSegments.length !== 3) return null;
-  return parseChildFolder(innerSegments[2]!);
+/** True for a folder name that is a grade or a lettered class, never a child. */
+function isGradeOrClassName(seg: string): boolean {
+  if (parseGrade(seg)) return true;
+  const k = parseClass(seg);
+  return !!k && k.confidence >= 0.95;
+}
+
+export interface ChildLocation extends ParsedChildFolder {
+  /** Folder names above the child, below the school: [grade?, class?]. */
+  above: string[];
+}
+
+/**
+ * Find the child's folder in a path below the school folder, whatever the
+ * depth. Studios lay folders out differently:
+ *
+ *     Class/Child/IMG.jpg                 (no grade level — common at crèches)
+ *     Grade/Class/Child/IMG.jpg
+ *     Child/IMG.jpg
+ *     Grade/Class/Child/Edited/IMG.jpg    (a working subfolder under the child)
+ *
+ * The child is the deepest folder that reads as a person's name, skipping
+ * working subfolders ("Edited", "Retakes", "RAW") and anything that is a
+ * grade or a lettered class. A lone one-word folder directly under the
+ * school is ambiguous (a class called "Apies", or a child called "Apies"?),
+ * so it is left for a person to name rather than guessed.
+ */
+export function childFolderFromPath(innerSegments: string[]): ChildLocation | null {
+  for (let i = innerSegments.length - 1; i >= 0; i--) {
+    const seg = innerSegments[i]!;
+    if (isGradeOrClassName(seg)) return null;      // reached the class level with no child
+    const parsed = parseChildFolder(seg);
+    if (!parsed) {
+      if (i === innerSegments.length - 1 || isWorkingFolder(seg)) continue; // e.g. "Edited" under the child
+      return null;
+    }
+    if (i === 0 && !parsed.lastName && !(parsed.emails?.length) && innerSegments.length === 1) return null;
+    return { ...parsed, above: innerSegments.slice(0, i) };
+  }
+  return null;
+}
+
+function isWorkingFolder(seg: string): boolean {
+  const n = normaliseFolderName(seg);
+  return !n || n.split(" ").some((w) => NON_NAME_WORDS.has(w)) || /^\d+$/.test(n.replace(/\s/g, ""));
 }

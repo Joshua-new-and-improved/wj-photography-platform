@@ -135,6 +135,9 @@ ${ORDER_ROWS_CSS(".dtable.list")}
   .dtable.kids .k-act .btn{width:100%}
 }
 .nowrap{white-space:nowrap}
+.emails{display:flex;flex-direction:column;gap:1px;margin-top:2px}
+.emails a{font-size:12.5px;color:#5D6068;word-break:break-all}
+.emails a:hover{color:var(--graphite);text-decoration:underline}
 .storebar{height:12px;border-radius:99px;background:#EFEDE8;overflow:hidden}
 .storebar i{display:block;height:100%;background:var(--green)}
 .storebar.warn i{background:#C77700}.storebar.bad i{background:var(--chinagraph)}

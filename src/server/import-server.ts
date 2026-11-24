@@ -15,7 +15,7 @@ import { page, escapeHtml } from "./views.js";
 import { formatRands, parseRands, FORMAT_RANDS_JS } from "../lib/commerce/money.js";
 import { getObject } from "../lib/storage/local.js";
 import { migrateOnBoot } from "./migrate.js";
-import { registerAdmin, backTo, KIND_LABEL } from "./admin.js";
+import { registerAdmin, backTo, KIND_LABEL, classLabel } from "./admin.js";
 import {
   readParentSession, sessionCanViewChild, createAnonymousGuardian, grantChildToBrowser,
   probeRlsRole, rlsEnforcedForParents, asGuardianRls, type ParentSession,
@@ -662,7 +662,7 @@ async function renderGallery(req: express.Request, res: express.Response, childI
   const cardPayments = yoco.connected;
 
   const firstName = c.first_name as string;
-  const classLine = [schoolLabel, c.grade_name, c.class_name ? `Class ${c.class_name}` : null].filter(Boolean).join(" · ");
+  const classLine = [schoolLabel, classLabel(c)].filter(Boolean).join(" · ");
 
   const grid = images.rows.length
     ? images.rows
@@ -1493,9 +1493,16 @@ app.post("/api/import/upload", upload.array("files"), async (req, res) => {
 
       if (match) {
         const first = match.firstName;
-        const last = match.lastName || "—";
+        const last = match.lastName; // may be empty: crèche folders often give only a first name
         const childId = await findOrCreateChild(studioId, school.id, first, last);
-        await ensureEnrolment(studioId, school.id, childId, inner[0]!, inner[1]!);
+        await ensureEnrolment(studioId, school.id, childId, match.above);
+        if (match.emails?.length) {
+          await pool.query(
+            `update child set contact_emails = array(select distinct e from unnest(contact_emails || $2::citext[]) e)
+              where id = $1`,
+            [childId, match.emails],
+          );
+        }
         await pool.query(`update import_file set child_id = $2 where id = $1`, [fileId, childId]);
         autoMatchedName = `${first} ${last}`.trim();
         await pool.query(`update import_file set status = 'processed' where id = $1`, [fileId]);
@@ -1555,21 +1562,32 @@ async function findOrCreateChild(studioId: string, schoolId: string, first: stri
  * gallery, the claim cards and the admin could not say which class a child
  * was in. Unrecognisable folder names are skipped rather than guessed.
  */
-async function ensureEnrolment(studioId: string, schoolId: string, childId: string, gradeRaw: string, classRaw: string) {
-  const g = parseGrade(gradeRaw);
-  const k = parseClass(classRaw);
-  if (!g || !k) return;
+async function ensureEnrolment(studioId: string, schoolId: string, childId: string, above: string[]) {
+  // The folders between the school and the child: [grade, class], [class]
+  // (crèches often have no grade level — "Apies", "Leeu"), [grade], or none.
+  const segs = above.slice(-2).map((x) => x.trim()).filter(Boolean);
+  if (!segs.length) return;
+  let gradeName = "", gradeNorm = "_none", gradeSort = 99, className = "";
+  const g = segs.length === 2 ? parseGrade(segs[0]!) : parseGrade(segs[0]!);
+  if (segs.length === 2) {
+    if (g) { gradeName = g.canonical; gradeNorm = g.level.toLowerCase(); gradeSort = g.level === "RR" ? -2 : g.level === "R" ? -1 : Number(g.level) || 0; }
+    else { gradeName = segs[0]!; gradeNorm = compactName(segs[0]!) || "_none"; gradeSort = 50; }
+    className = parseClass(segs[1]!)?.canonical ?? segs[1]!;
+  } else if (g) {
+    gradeName = g.canonical; gradeNorm = g.level.toLowerCase(); gradeSort = g.level === "RR" ? -2 : g.level === "R" ? -1 : Number(g.level) || 0;
+  } else {
+    className = parseClass(segs[0]!)?.canonical ?? segs[0]!;
+  }
   const year = new Date().getFullYear();
-  const sort = g.level === "RR" ? -2 : g.level === "R" ? -1 : Number(g.level) || 0;
   const grade = await pool.query(
     `insert into grade (studio_id, school_id, name, name_norm, sort_order) values ($1,$2,$3,$4,$5)
      on conflict (school_id, name_norm) do update set name = grade.name returning id`,
-    [studioId, schoolId, g.canonical, g.level.toLowerCase(), sort],
+    [studioId, schoolId, gradeName, gradeNorm, gradeSort],
   );
   const klass = await pool.query(
     `insert into class_group (studio_id, school_id, grade_id, name, name_norm, academic_year) values ($1,$2,$3,$4,$5,$6)
      on conflict (school_id, grade_id, name_norm, academic_year) do update set name = class_group.name returning id`,
-    [studioId, schoolId, grade.rows[0].id, k.canonical, compactName(k.canonical), year],
+    [studioId, schoolId, grade.rows[0].id, className, compactName(className) || "_none", year],
   );
   await pool.query(
     `insert into enrolment (studio_id, child_id, class_group_id, academic_year) values ($1,$2,$3,$4)
@@ -1609,8 +1627,8 @@ app.post("/api/import/:batchId/segment", async (req, res) => {
 app.post("/api/import/:batchId/tag", async (req, res) => {
   try {
     const { fileId, firstName, lastName } = req.body as { fileId: string; firstName: string; lastName: string };
-    if (!fileId || !firstName || !lastName) {
-      return res.status(400).json({ error: "fileId, firstName and lastName are all required." });
+    if (!fileId || !String(firstName ?? "").trim()) {
+      return res.status(400).json({ error: "A first name is required." });
     }
     const info = await pool.query(
       `select if_.studio_id, ib.shoot_id, sh.school_id
@@ -1623,11 +1641,12 @@ app.post("/api/import/:batchId/tag", async (req, res) => {
     if (info.rowCount === 0) return res.status(404).json({ error: "Unknown file." });
     const { studio_id: studioId, school_id: schoolId } = info.rows[0];
 
-    const childId = await findOrCreateChild(studioId, schoolId, firstName, lastName);
+    const childId = await findOrCreateChild(studioId, schoolId, String(firstName).trim(), String(lastName ?? "").trim());
     // A stray photo still sits in a grade/class folder; use it for the class.
     const path = (await pool.query(`select relative_path from import_file where id = $1`, [fileId])).rows[0]?.relative_path ?? "";
     const segs = String(path).split("/");
-    if (segs.length >= 4) await ensureEnrolment(studioId, schoolId, childId, segs[1]!, segs[2]!);
+    const inner = segs.slice(1, -1);
+    await ensureEnrolment(studioId, schoolId, childId, childFolderFromPath(inner)?.above ?? inner);
 
     await pool.query(`update import_file set status = 'processed', child_id = $2 where id = $1`, [fileId, childId]);
 

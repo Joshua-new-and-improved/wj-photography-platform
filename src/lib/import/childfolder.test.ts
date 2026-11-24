@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseChildFolder, childFolderFromPath } from "./childfolder.js";
+import { parseChildFolder, childFolderFromPath, splitChildFolder } from "./childfolder.js";
 
 describe("parsing a child's name from their folder", () => {
   it("splits the common Firstname Lastname shape", () => {
@@ -76,8 +76,44 @@ describe("locating the child folder in a path", () => {
     expect(childFolderFromPath(["Grade R", "Class A"])).toBeNull();
   });
 
-  it("does not guess at a deeper or shallower layout", () => {
-    expect(childFolderFromPath(["Grade R", "Class A", "Noah", "Retakes"])).toBeNull();
-    expect(childFolderFromPath(["Noah Botha"])).toBeNull();
+  it("finds the child under a working subfolder like Retakes or Edited", () => {
+    expect(childFolderFromPath(["Grade R", "Class A", "Noah Botha", "Retakes"])).toMatchObject({ firstName: "Noah", lastName: "Botha" });
+    expect(childFolderFromPath(["Grade R", "Class A", "Noah Botha", "Edited"])?.above).toEqual(["Grade R", "Class A"]);
+  });
+
+  it("accepts a child folder directly under the school when it is clearly a name", () => {
+    expect(childFolderFromPath(["Noah Botha"])).toMatchObject({ firstName: "Noah", lastName: "Botha", above: [] });
+  });
+
+  it("leaves a lone one-word folder for a person: class or child is ambiguous", () => {
+    expect(childFolderFromPath(["Apies"])).toBeNull();
+  });
+});
+
+// The layout a crèche actually sent (2026-11-24): no grade level, animal class
+// names, numbered child folders with the parent's email in the name.
+describe("crèche layout: School/Class/'N. Name parent@email'", () => {
+  it("strips the list number and pulls out the email", () => {
+    expect(splitChildFolder("1. Ioannis parent.one@example.com")).toEqual({ name: "Ioannis", emails: ["parent.one@example.com"] });
+    expect(splitChildFolder("4. Benolalo P.Two@Example.co.za")).toEqual({ name: "Benolalo", emails: ["p.two@example.co.za"] });
+    expect(splitChildFolder("3. Simthabele")).toEqual({ name: "Simthabele", emails: [] });
+    expect(splitChildFolder("01 - Mia Botha (mia.mom@example.com)")).toEqual({ name: "Mia Botha", emails: ["mia.mom@example.com"] });
+    expect(splitChildFolder("12)Liam Naidoo")).toEqual({ name: "Liam Naidoo", emails: [] });
+  });
+
+  it("matches the child under a class with no grade, name without the email", () => {
+    const r = childFolderFromPath(["Apies", "1. Ioannis parent.one@example.com"]);
+    expect(r).toMatchObject({ firstName: "Ioannis", lastName: "", emails: ["parent.one@example.com"], above: ["Apies"] });
+    expect(childFolderFromPath(["Leeu", "2. Khulezi parent.two@example.com"])?.firstName).toBe("Khulezi");
+    expect(childFolderFromPath(["Slange", "3. Simthabele"])).toMatchObject({ firstName: "Simthabele", above: ["Slange"] });
+  });
+
+  it("keeps two-word names and several emails", () => {
+    const r = parseChildFolder("5. Ruvan Pillay mom@example.com, dad@example.com");
+    expect(r).toMatchObject({ firstName: "Ruvan", lastName: "Pillay", emails: ["mom@example.com", "dad@example.com"] });
+  });
+
+  it("a numbered folder name is never mistaken for a working folder", () => {
+    expect(childFolderFromPath(["Grade 1", "Class A", "7. Noah Botha"])).toMatchObject({ firstName: "Noah", lastName: "Botha" });
   });
 });

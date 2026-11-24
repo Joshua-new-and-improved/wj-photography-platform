@@ -56,7 +56,7 @@ const ORDER_ROWS = `
   select o.id, o.order_number, o.total_cents, o.payment_status, o.fulfilment_status, o.digital_status,
          o.placed_at, o.offline_method, o.offline_ref, coalesce(o.contact_email, g.email) as email,
          coalesce(s.display_name, s.name) as school, s.id as school_id,
-         ch.id as child_id, ch.first_name || ' ' || ch.last_name as child,
+         ch.id as child_id, btrim(ch.first_name || ' ' || ch.last_name) as child,
          en.class_name, en.grade_name,
          ${NEEDS_PRODUCTION} as needs_production,
          (select string_agg(t.label, ', ') from (
@@ -90,8 +90,10 @@ const FILTERS: Record<Filter, { label: string; where: string }> = {
   },
 };
 
-function classLabel(o: { grade_name?: string | null; class_name?: string | null }): string {
-  return [o.grade_name, o.class_name ? `Class ${o.class_name}` : null].filter(Boolean).join(" · ");
+/** "Grade 1 · Class A", or just "Apies" for a named class with no grade. */
+export function classLabel(o: { grade_name?: string | null; class_name?: string | null }): string {
+  const k = o.class_name ? (/^[A-Z]$/i.test(o.class_name) ? `Class ${o.class_name}` : o.class_name) : null;
+  return [o.grade_name, k].filter(Boolean).join(" · ");
 }
 
 function paymentChip(status: string, offline?: string | null): string {
@@ -376,6 +378,9 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
     )).rows[0];
     const t = await thumbs([...new Set(lines.rows.flatMap((l) => lineAssets(l.snapshot)))]);
     const childLabel = (o.child ?? "photo").replace(/[^\p{L}\p{N} ]/gu, "");
+    const childEmails: string[] = o.child_id
+      ? (await pool.query(`select contact_emails::text[] as contact_emails from child where id = $1`, [o.child_id])).rows[0]?.contact_emails ?? []
+      : [];
 
     const paid = o.payment_status === "settled";
     const actions: string[] = [];
@@ -431,7 +436,8 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
               <dt>Child</dt><dd>${o.child_id ? `<a href="/admin/preview/${o.child_id}" style="text-decoration:underline">${escapeHtml(o.child)}</a>` : "—"}</dd>
               <dt>School</dt><dd><a href="/admin/schools/${o.school_id}" style="text-decoration:underline">${escapeHtml(o.school)}</a></dd>
               <dt>Class</dt><dd>${escapeHtml(classLabel(o) || "—")}</dd>
-              <dt>Parent email</dt><dd>${o.email && !o.email.endsWith("@claim.invalid") ? `<a href="mailto:${escapeHtml(o.email)}" style="text-decoration:underline">${escapeHtml(o.email)}</a>` : "—"}</dd>
+              <dt>Receipt email</dt><dd>${o.email && !o.email.endsWith("@claim.invalid") ? `<a href="mailto:${escapeHtml(o.email)}" style="text-decoration:underline">${escapeHtml(o.email)}</a>` : "—"}</dd>
+              <dt>School list</dt><dd>${childEmails.length ? childEmails.map((e) => `<a href="mailto:${escapeHtml(e)}" style="text-decoration:underline">${escapeHtml(e)}</a>`).join("<br>") : "—"}</dd>
             </dl>
           </section>
           ${pays.rowCount ? `<section class="panel"><h2>Payment attempts</h2>
@@ -666,7 +672,7 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
     if (q) { params.push(`%${q}%`); filter += ` and app.immutable_unaccent(c.first_name || ' ' || c.last_name) ilike app.immutable_unaccent($${params.length})`; }
     if (cls) { params.push(cls); filter += ` and en.class_id = $${params.length}`; }
     const children = await pool.query(
-      `select c.id, c.first_name, c.last_name, en.class_name, en.grade_name,
+      `select c.id, c.first_name, c.last_name, c.contact_emails::text[] as contact_emails, en.class_name, en.grade_name,
               (select count(*) from gallery_item gi where gi.child_id = c.id) as photos,
               exists(select 1 from claim_code cc where cc.child_id = c.id and cc.redeemed_at is not null) as claimed,
               exists(select 1 from claim_code cc where cc.child_id = c.id and cc.revoked_at is null) as has_code,
@@ -694,6 +700,7 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
       title: s.display_name || s.name,
       active: "schools",
       actions: `<a class="btn small ghost" href="/admin/orders?school=${s.id}">Orders</a>
+        <a class="btn small ghost" href="/admin/schools/${s.id}/children.csv">Download list</a>
         <a class="btn small ghost" href="/admin/cards/${s.id}">Print claim cards</a>
         <a class="btn small" href="/import.html">＋ Import more photos</a>`,
       body: `
@@ -707,13 +714,14 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
         <form class="toolbar" method="get">
           <div class="search"><input name="q" value="${escapeHtml(q)}" placeholder="Search by name (Zane finds Zané)" aria-label="Search children"></div>
           <select name="class" aria-label="Class" onchange="this.form.submit()"><option value="">All classes</option>
-            ${classes.rows.map((c) => `<option value="${c.id}" ${c.id === cls ? "selected" : ""}>${escapeHtml(c.grade)} · Class ${escapeHtml(c.name)}</option>`).join("")}</select>
+            ${classes.rows.map((c) => `<option value="${c.id}" ${c.id === cls ? "selected" : ""}>${escapeHtml(classLabel({ grade_name: c.grade, class_name: c.name }) || "No class")}</option>`).join("")}</select>
           <button class="btn small" type="submit">Search</button>
           ${q || cls ? `<a class="btn small ghost" href="/admin/schools/${s.id}">Clear</a>` : ""}
         </form>
-        ${children.rowCount ? `<div class="tablewrap"><table class="dtable kids"><thead><tr><th>Child</th><th>Class</th><th class="num">Photos</th><th>Card</th><th class="num">Paid orders</th><th></th></tr></thead><tbody>
+        ${children.rowCount ? `<div class="tablewrap"><table class="dtable kids"><thead><tr><th>Child &amp; parent email</th><th>Class</th><th class="num">Photos</th><th>Card</th><th class="num">Paid orders</th><th></th></tr></thead><tbody>
           ${children.rows.map((c) => `<tr>
-            <td class="k-name strong">${escapeHtml(c.first_name)} ${escapeHtml(c.last_name)}</td>
+            <td class="k-name"><span class="strong">${escapeHtml(c.first_name)} ${escapeHtml(c.last_name)}</span>
+              ${(c.contact_emails ?? []).length ? `<div class="emails">${(c.contact_emails as string[]).map((e) => `<a href="mailto:${escapeHtml(e)}">${escapeHtml(e)}</a>`).join("")}</div>` : ""}</td>
             <td class="k-class muted">${escapeHtml(classLabel(c) || "—")} <span class="k-sm">· ${c.photos} photos · ${c.paid_orders} paid</span></td>
             <td class="k-num num">${c.photos}</td>
             <td class="k-card">${c.claimed ? chip("Claimed", "ok") : c.has_code ? chip("Card printed", "muted") : chip("No card yet", "warn")}</td>
@@ -731,6 +739,37 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
         <p class="muted" style="margin-top:8px">Folder name on import: ${escapeHtml(s.name)}</p>
       </section>`,
     });
+  });
+
+  // Class list with parent emails and card status, for the studio's records
+  // or a mail merge.
+  app.get("/admin/schools/:id/children.csv", async (req, res) => {
+    const { studioId } = await ensureStudioAndStaff();
+    if (!UUID_RE.test(req.params.id)) return res.status(404).send("Unknown school.");
+    const s = (await pool.query(`select coalesce(display_name, name) as name from school where id = $1 and studio_id = $2`, [req.params.id, studioId])).rows[0];
+    if (!s) return res.status(404).send("Unknown school.");
+    const rows = (await pool.query(
+      `select c.first_name, c.last_name, c.contact_emails::text[] as contact_emails, en.class_name, en.grade_name,
+              (select count(*) from gallery_item gi where gi.child_id = c.id) as photos,
+              exists(select 1 from claim_code cc where cc.child_id = c.id and cc.redeemed_at is not null) as claimed,
+              (select count(distinct ol.order_id) from order_line ol join "order" o on o.id = ol.order_id
+                where ol.child_id = c.id and o.payment_status = 'settled') as paid_orders
+         from child c
+         left join lateral (select cl.name as class_name, gr.name as grade_name, gr.sort_order
+                              from enrolment e join class_group cl on cl.id = e.class_group_id left join grade gr on gr.id = cl.grade_id
+                             where e.child_id = c.id order by e.academic_year desc limit 1) en on true
+        where c.school_id = $1 order by en.sort_order nulls last, en.class_name nulls last, c.last_name, c.first_name`,
+      [req.params.id],
+    )).rows;
+    const cell = (v: unknown) => { let x = String(v ?? ""); if (/^[=+\-@]/.test(x)) x = "'" + x; return `"${x.replace(/"/g, '""')}"`; };
+    const out = [["Child", "Class", "Parent emails", "Photos", "Card claimed", "Paid orders"].map(cell).join(",")];
+    for (const r of rows) {
+      out.push([`${r.first_name} ${r.last_name}`.trim(), classLabel(r), (r.contact_emails ?? []).join("; "),
+        r.photos, r.claimed ? "yes" : "no", r.paid_orders].map(cell).join(","));
+    }
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${s.name.replace(/[^\w -]/g, "_")} children.csv"`);
+    res.send("\uFEFF" + out.join("\r\n"));
   });
 
   app.post("/admin/school/:id", async (req, res) => {
@@ -820,7 +859,7 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
         ${issued.length ? `<p class="muted" style="margin-bottom:14px">These codes are shown only once. Print now — leaving this page and coming back will not show them again (you can always reprint).</p>` : ""}
         ${earlier.length ? `<section class="panel"><h2>Printed earlier (${earlier.length})</h2>
           <p class="sub">Those cards still work. If they were lost, reprint — the old cards stop working and new ones appear here.</p>
-          <div class="muted" style="margin-bottom:12px">${earlier.map((k) => escapeHtml(`${k.first_name} ${k.last_name}`)).join(", ")}</div>
+          <div class="muted" style="margin-bottom:12px">${earlier.map((k) => escapeHtml(`${k.first_name} ${k.last_name}`.trim())).join(", ")}</div>
           <form method="post" action="/admin/cards/${school.id}/reissue" onsubmit="return confirm('Make new cards for ${earlier.length} child(ren)? Their old cards will stop working.')">
             <button class="btn small ghost" type="submit">Reprint unclaimed cards</button></form></section>` : ""}
         ${!issued.length && !earlier.length ? `<div class="panel empty-state"><b>Nothing to print</b>Every child's card has been claimed by a parent.</div>` : ""}
@@ -829,7 +868,7 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
         <section class="cardsheet">
           <h2 class="sheethead">${escapeHtml(school.name)} · ${escapeHtml(cls)} <span>${list.length} card${list.length === 1 ? "" : "s"}</span></h2>
           <div class="cardgrid">${list.map((i) => `
-            <article class="claimcard" data-child="${escapeHtml(`${i.kid.first_name} ${i.kid.last_name}`)}" data-code="${i.code}">
+            <article class="claimcard" data-child="${escapeHtml(`${i.kid.first_name} ${i.kid.last_name}`.trim())}" data-code="${i.code}">
               <div class="cc-brand">WIAAN JORDAAN <span>PHOTOGRAPHY</span></div>
               <div class="cc-name">${escapeHtml(i.kid.first_name)} ${escapeHtml(i.kid.last_name)}</div>
               <div class="cc-class">${escapeHtml(school.name)}${classLabel(i.kid) ? " · " + escapeHtml(classLabel(i.kid)) : ""}</div>

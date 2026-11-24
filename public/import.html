@@ -398,15 +398,15 @@ function render(){
     }else{
       el.className='card';
       el.innerHTML=`<img src="${s.thumbUrl}" alt="" loading="lazy"><div class="tag">
-        <input placeholder="First name" class="fn" autocomplete="off"><input placeholder="Surname" class="ln" autocomplete="off"><button type="button">Save name</button></div>`;
+        <input placeholder="First name" class="fn" autocomplete="off"><input placeholder="Surname (optional)" class="ln" autocomplete="off"><button type="button">Save name</button></div>`;
       el.querySelector('.ln').value=lastName;
       el.querySelector('button').onclick=async()=>{
         const fn=el.querySelector('.fn').value.trim(), ln=el.querySelector('.ln').value.trim();
-        if(!fn||!ln){ el.querySelector(fn?'.ln':'.fn').focus(); return; }
+        if(!fn){ el.querySelector('.fn').focus(); return; }
         lastName=ln;
         const r=await fetch(api('/api/import/x/tag'),{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({fileId:s.id,firstName:fn,lastName:ln})});
-        if(r.ok){ s.tagged=fn+' '+ln; render(); }
+        if(r.ok){ s.tagged=(fn+' '+ln).trim(); render(); }
       };
     }
     grid.appendChild(el);
