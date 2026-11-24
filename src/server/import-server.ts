@@ -7,7 +7,8 @@ import { proposeStructure, similarity, parseGrade, parseClass, compactName, type
 import { childFolderFromPath } from "../lib/import/childfolder.js";
 import { segmentBySlates, reviewSummary, type Frame } from "../lib/import/segment.js";
 import { deriveVariants } from "../lib/media/derive.js";
-import { putObject, publicUrl, randomKey } from "../lib/storage/local.js";
+import { putObject, publicUrl, randomKey, deleteObject } from "../lib/storage/local.js";
+import { diskStatus, bytesNeeded, storageFullMessage, sweepOrphans } from "./storage-health.js";
 import { redeemClaimCode, completeClaim } from "../lib/claim.js";
 import { generateOrderNumber, normaliseCode } from "../lib/ids.js";
 import { page, escapeHtml } from "./views.js";
@@ -1374,7 +1375,16 @@ app.post("/admin/package/:id", async (req, res) => {
 // IMPORT PIPELINE
 // ============================================================================
 
+// The importer asks this before it starts, so a folder too big for the disk is
+// stopped with a clear message instead of failing halfway through.
+app.get("/api/import/capacity", async (_req, res) => {
+  res.json((await diskStatus()) ?? { unknown: true });
+});
+
 app.post("/api/import/upload", upload.array("files"), async (req, res) => {
+  // Everything this request writes, so a failure can take it all back.
+  const written: string[] = [];
+  let batchId: string | null = null;
   try {
     const { studioId, staffId } = await ensureStudioAndStaff();
     const files = (req.files as Express.Multer.File[]) ?? [];
@@ -1382,6 +1392,14 @@ app.post("/api/import/upload", upload.array("files"), async (req, res) => {
 
     if (files.length === 0) {
       return res.status(400).json({ error: "No files received." });
+    }
+
+    // Refuse up front when the disk can't take this batch, with a message a
+    // person can act on — instead of writing half of it and failing.
+    const disk = await diskStatus();
+    const need = bytesNeeded(files.reduce((n, f) => n + f.size, 0));
+    if (disk && disk.freeBytes < need) {
+      return res.status(507).json({ error: storageFullMessage(disk.freeBytes, need), code: "storage_full" });
     }
 
     const uploadedForProposal: UploadedFile[] = files.map((f, i) => ({
@@ -1402,7 +1420,7 @@ app.post("/api/import/upload", upload.array("files"), async (req, res) => {
        returning id`,
       [studioId, shootId, staffId, files.length, JSON.stringify(proposal)],
     );
-    const batchId = batch.rows[0].id as string;
+    batchId = batch.rows[0].id as string;
 
     const staged: Array<{
       id: string;
@@ -1444,28 +1462,31 @@ app.post("/api/import/upload", upload.array("files"), async (req, res) => {
       }
 
       const originalKey = randomKey("originals", "jpg");
+      written.push(originalKey);
       await putObject(originalKey, f.buffer);
       const thumb = variants.find((v) => v.kind === "thumb" && v.format === "webp")!;
       const thumbKey = randomKey("variants/thumb", "webp");
+      written.push(thumbKey);
       await putObject(thumbKey, thumb.data);
       const previewJpeg = variants.find((v) => v.kind === "preview");
       const previewKey = randomKey("variants/preview", previewJpeg!.format);
+      written.push(previewKey);
       await putObject(previewKey, previewJpeg!.data);
 
       const fileId = randomUUID();
       await pool.query(
-        `insert into import_file (id, studio_id, import_batch_id, relative_path, file_name, bytes, sha256, status)
-         values ($1,$2,$3,$4,$5,$6,$7,'uploaded')`,
-        [fileId, studioId, batchId, relativePath, f.originalname, f.size, source.sha256],
+        `insert into import_file (id, studio_id, import_batch_id, relative_path, file_name, bytes, sha256, status,
+                                  original_key, thumb_key, preview_key, width, height)
+         values ($1,$2,$3,$4,$5,$6,$7,'uploaded',$8,$9,$10,$11,$12)`,
+        [fileId, studioId, batchId, relativePath, f.originalname, f.size, source.sha256,
+         originalKey, thumbKey, previewKey, source.width, source.height],
       );
 
-      STAGED_KEYS.set(fileId, {
-        originalKey, thumbKey, previewKey, width: source.width, height: source.height, bytes: f.size,
-      });
+
 
       // Auto-match by folder name: grade/class/child three levels below the
       // school folder. If it matches, the child is found-or-created and
-      // TAG_MAP is populated immediately — Wiaan never types this name.
+      // recorded on the row immediately — Wiaan never types this name.
       const inner = relativePath.split("/").slice(1, -1); // drop school folder + filename
       const match = childFolderFromPath(inner);
       let autoMatchedName: string | null = null;
@@ -1475,7 +1496,7 @@ app.post("/api/import/upload", upload.array("files"), async (req, res) => {
         const last = match.lastName || "—";
         const childId = await findOrCreateChild(studioId, school.id, first, last);
         await ensureEnrolment(studioId, school.id, childId, inner[0]!, inner[1]!);
-        TAG_MAP.set(fileId, childId!);
+        await pool.query(`update import_file set child_id = $2 where id = $1`, [fileId, childId]);
         autoMatchedName = `${first} ${last}`.trim();
         await pool.query(`update import_file set status = 'processed' where id = $1`, [fileId]);
       }
@@ -1493,6 +1514,17 @@ app.post("/api/import/upload", upload.array("files"), async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+    // Take the half-written batch back out: its files would otherwise sit on
+    // the disk with nothing pointing at them. The browser retries the batch.
+    for (const k of written) await deleteObject(k);
+    if (batchId) {
+      await pool.query(`delete from import_file where import_batch_id = $1`, [batchId]).catch(() => {});
+      await pool.query(`update import_batch set status = 'failed' where id = $1`, [batchId]).catch(() => {});
+    }
+    if ((err as NodeJS.ErrnoException).code === "ENOSPC") {
+      const disk = await diskStatus();
+      return res.status(507).json({ error: storageFullMessage(disk?.freeBytes ?? 0, 0).replace(/, and this needs about 0 MB/, ""), code: "storage_full" });
+    }
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -1546,26 +1578,22 @@ async function ensureEnrolment(studioId: string, schoolId: string, childId: stri
   );
 }
 
-const STAGED_KEYS = new Map<
-  string,
-  { originalKey: string; thumbKey: string; previewKey: string; width: number; height: number; bytes: number }
->();
-const TAG_MAP = new Map<string, string>();
+
 
 app.post("/api/import/:batchId/segment", async (req, res) => {
   try {
     const { batchId } = req.params;
     const rows = (
       await pool.query(
-        `select id, relative_path, sha256 from import_file where import_batch_id = $1 order by relative_path`,
+        `select id, relative_path, sha256, child_id from import_file where import_batch_id = $1 order by relative_path`,
         [batchId],
       )
     ).rows;
 
-    // Files already auto-matched by folder name (TAG_MAP) do not need
+    // Files already matched to a child (child_id) do not need
     // segmentation or manual tagging — only the leftovers go through the
     // slate/manual path from §7.3.
-    const remaining = rows.filter((r) => !TAG_MAP.has(r.id));
+    const remaining = rows.filter((r) => !r.child_id);
     const frames: Frame[] = remaining.map((r) => ({
       assetId: r.id, capturedAt: null, frameSeq: null, slateCode: null,
     }));
@@ -1601,8 +1629,7 @@ app.post("/api/import/:batchId/tag", async (req, res) => {
     const segs = String(path).split("/");
     if (segs.length >= 4) await ensureEnrolment(studioId, schoolId, childId, segs[1]!, segs[2]!);
 
-    await pool.query(`update import_file set status = 'processed' where id = $1`, [fileId]);
-    TAG_MAP.set(fileId, childId!);
+    await pool.query(`update import_file set status = 'processed', child_id = $2 where id = $1`, [fileId, childId]);
 
     res.json({ childId });
   } catch (err) {
@@ -1619,6 +1646,7 @@ app.post("/api/import/:batchId/commit", async (req, res) => {
     const files = (
       await client.query(
         `select f.id, f.studio_id, f.import_batch_id, f.relative_path, f.file_name, f.bytes, f.sha256,
+                f.original_key, f.thumb_key, f.preview_key, f.width, f.height, f.child_id,
                 b.shoot_id
            from import_file f join import_batch b on b.id = f.import_batch_id
           where f.import_batch_id = $1 and f.status in ('uploaded','processed')`,
@@ -1639,8 +1667,8 @@ app.post("/api/import/:batchId/commit", async (req, res) => {
     await client.query("select set_config('app.staff_role', 'photographer', true)");
 
     for (const f of files) {
-      const keys = STAGED_KEYS.get(f.id);
-      if (!keys) continue;
+      // Rows staged before 0016 have no keys recorded; nothing to publish.
+      if (!f.original_key || !f.thumb_key || !f.preview_key) continue;
 
       const asset = await client.query(
         `insert into asset (studio_id, shoot_id, sha256, storage_key, bytes, width, height,
@@ -1648,22 +1676,22 @@ app.post("/api/import/:batchId/commit", async (req, res) => {
          values ($1,$2,$3,$4,$5,$6,$7,'image/jpeg',$8,$9,'ready')
          on conflict (studio_id, sha256) do update set status = 'ready'
          returning id`,
-        [f.studio_id, shootId, f.sha256, keys.originalKey, keys.bytes, keys.width, keys.height, f.file_name, f.relative_path],
+        [f.studio_id, shootId, f.sha256, f.original_key, f.bytes, f.width, f.height, f.file_name, f.relative_path],
       );
       const assetId = asset.rows[0].id;
 
       await client.query(
         `insert into asset_variant (asset_id, studio_id, kind, format, storage_key, width, height, bytes, watermarked)
          values ($1,$2,'thumb','webp',$3,400,600,1,true) on conflict (asset_id, kind, format) do nothing`,
-        [assetId, f.studio_id, keys.thumbKey],
+        [assetId, f.studio_id, f.thumb_key],
       );
       await client.query(
         `insert into asset_variant (asset_id, studio_id, kind, format, storage_key, width, height, bytes, watermarked)
          values ($1,$2,'preview','webp',$3,1200,1800,1,true) on conflict (asset_id, kind, format) do nothing`,
-        [assetId, f.studio_id, keys.previewKey],
+        [assetId, f.studio_id, f.preview_key],
       );
 
-      const childId = TAG_MAP.get(f.id);
+      const childId = f.child_id as string | null;
       if (childId) {
         await client.query(
           `insert into gallery_item (studio_id, asset_id, child_id, role, assigned_by, confidence)
@@ -1705,6 +1733,7 @@ app.get("/api/health", async (_req, res) => {
       db: "connected",
       migrations: bootState.migrations,
       parentAccess: rlsEnforcedForParents() ? "session+rls" : "session",
+      storageUsedPct: (await diskStatus())?.usedPct ?? null,
       payments: y?.connected ? { provider: "yoco", mode: y.mode, webhook: y.webhookReady } : { provider: "manual" },
     });
   } catch (err) {
@@ -1834,6 +1863,21 @@ async function structureStarterPackages(studioId: string) {
 const migration = await migrateOnBoot(pool);
 bootState.migrations = migration.status;
 await probeRlsRole(pool);
+
+// Reclaim disk space held by files nothing refers to (failed or abandoned
+// uploads). Safe to run any time: see sweepOrphans. Then every 6 hours.
+const sweep = async () => {
+  try {
+    const r = await sweepOrphans(pool);
+    if (r.deleted) console.log({ event: "storage.swept", ...r });
+  } catch (err) {
+    console.error({ event: "storage.sweep_failed", err: (err as Error).message });
+  }
+};
+if (migration.status === "ok") {
+  void sweep();
+  setInterval(sweep, 6 * 3600_000).unref();
+}
 try {
   const { studioId } = await ensureStudioAndStaff();
   await structureStarterPackages(studioId);

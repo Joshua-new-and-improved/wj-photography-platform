@@ -15,6 +15,16 @@ import { randomBytes } from "node:crypto";
 
 const ROOT = process.env.STORAGE_ROOT ?? join(process.cwd(), "storage");
 
+/** Where objects live on disk (the Railway volume in production). */
+export function storageRoot(): string {
+  return ROOT;
+}
+
+export async function deleteObject(key: string): Promise<void> {
+  const { unlink } = await import("node:fs/promises");
+  await unlink(join(ROOT, key)).catch(() => {});
+}
+
 export function randomKey(prefix: string, ext: string): string {
   return `${prefix}/${randomBytes(16).toString("hex")}.${ext}`;
 }

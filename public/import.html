@@ -44,6 +44,8 @@ h1{font-family:var(--display);font-size:clamp(24px,4vw,32px);letter-spacing:-.03
 .pulse.bad{background:var(--chinagraph)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
 .stall{margin-top:10px;padding:10px 12px;border-radius:8px;background:#FBEBD5;color:#8A5200;font-size:14px}
+.blocker{margin-top:12px;padding:14px;border-radius:8px;background:#FBE3E4;color:#7A1018;font-size:14.5px;line-height:1.5}
+.blocker b{display:block;font-size:16px;margin-bottom:4px}
 .guide{margin-top:12px;padding:12px 14px;border-radius:8px;background:#F0F7F4;color:#1F4D3B;font-size:14px;line-height:1.5}
 .guide .h{display:block;font-weight:700;margin-bottom:2px}
 .guide.done{background:#FAF9F6;color:var(--graphite)}
@@ -107,6 +109,7 @@ h1{font-family:var(--display);font-size:clamp(24px,4vw,32px);letter-spacing:-.03
       <div class="guide" id="guide"></div>
       <div class="arrived" id="arrivedWrap" hidden><div class="arrived-label">Arrived on the server</div><div class="arrived-strip" id="arrived"></div></div>
     </div>
+    <div class="blocker" id="blocker" hidden></div>
     <div class="log" id="log" hidden></div>
   </section>
 
@@ -172,7 +175,8 @@ function send(fd,onProgress){
     x.timeout=15*60*1000;
     x.upload.onprogress=e=>{ if(e.lengthComputable) onProgress(e.loaded,e.total); };
     x.upload.onload=()=>onProgress(null,null);           // all bytes sent; server is processing
-    x.onload=()=>{ const r=x.response||{}; x.status>=200&&x.status<300 ? resolve(r) : reject(new Error(r.error||('server said '+x.status))); };
+    x.onload=()=>{ const r=x.response||{}; if(x.status>=200&&x.status<300) return resolve(r);
+      const e=new Error(r.error||('server said '+x.status)); e.status=x.status; e.code=r.code; reject(e); };
     x.onerror=()=>reject(new Error('connection lost'));
     x.ontimeout=()=>reject(new Error('timed out'));
     x.send(fd);
@@ -211,6 +215,10 @@ function leftText(s){
   const m=Math.round(s/60); if(m<60) return 'About '+m+' min left';
   return 'About '+Math.floor(m/60)+' h '+(m%60)+' min left';
 }
+function showBlocker(title,html){
+  const b=$('blocker'); b.hidden=false; b.innerHTML='<b>'+title+'</b>'+html;
+  b.scrollIntoView({behavior:'smooth',block:'center'});
+}
 function showArrived(list){
   const strip=$('arrived'); $('arrivedWrap').hidden=false;
   list.slice(-8).forEach(s=>{ const i=new Image(); i.src=s.thumbUrl; i.alt=''; strip.prepend(i); });
@@ -218,10 +226,22 @@ function showArrived(list){
 }
 
 async function start(all){
+  $('blocker').hidden=true;
   const files=all.filter(f=>IMG.test(f.path) && !f.path.split('/').some(p=>p.startsWith('.')));
   if(!files.length){ log('No photos found in that folder.'); return; }
   const top=new Set(files.map(f=>f.path.split('/')[0]));
   if(top.size>1){ log('Please import one school folder at a time (found: '+[...top].join(', ')+').'); return; }
+
+  const need=Math.ceil(files.reduce((n,f)=>n+f.file.size,0)*1.15)+20*1024*1024;
+  try{
+    const cap=await (await fetch(api('/api/import/capacity'))).json();
+    if(cap && typeof cap.freeBytes==='number' && cap.freeBytes<need){
+      showBlocker(`Not enough storage for this folder`,
+        `This folder needs about <b style="display:inline;font-size:inherit">${mb(need)}</b> on the server, but only ${mb(cap.freeBytes)} of ${mb(cap.totalBytes)} is free. `
+        +`Increase the storage first (Railway → precious-joy-volume → Settings), or import a smaller part of the folder (for example one grade at a time). Nothing has been uploaded.`);
+      return;
+    }
+  }catch(e){ /* couldn't check — the server refuses per batch anyway */ }
 
   drop.hidden=true; document.querySelector('.example').hidden=true; $('progressBox').hidden=false;
   const groups=[]; let cur=[], bytes=0;
@@ -244,7 +264,7 @@ async function start(all){
   const SEND_SHARE=0.55;
   let doneBytes=0, done=0, failed=0, lastTick=Date.now(), current=0;
   let procStart=0, procExpect=0, procSecsPerMB=null, gBytesNow=0, sending=false;
-  let netBytes=0, netSecs=0, lastLoaded=0, lastAt=0;   // upload speed, measured only while bytes are moving
+  let netBytes=0, netSecs=0, lastLoaded=0, lastAt=0, stopped=null;   // upload speed, measured only while bytes are moving
   const t0=Date.now();
   uploading=true; keepAwake(true);
   const stallTimer=setInterval(()=>{
@@ -285,14 +305,17 @@ async function start(all){
     g.forEach(f=>{ fd.append('files',f.file); fd.append('relativePaths',f.path); });
     let data=null;
     gBytesNow=gBytes;
-    for(let attempt=1;attempt<=3;attempt++){
+    // Retry what can recover: a dropped connection, or the server restarting
+    // (502/503/504 for up to a minute). A full disk (507) stops everything —
+    // retrying can't help, and the person needs to know now.
+    const WAITS=[3,6,12,20,30];
+    for(let attempt=1;attempt<=WAITS.length+1;attempt++){
       current=0; lastTick=Date.now(); sending=true; procStart=0; lastLoaded=0; lastAt=0;
       phase(`Sending ${range}…`);
       try{
         data=await send(fd,(loaded,total)=>{
           if(loaded===null){
             sending=false; procStart=Date.now(); $('stall').hidden=true;
-            // First batch: assume ~2.5 s per photo; afterwards, measured.
             procExpect=procSecsPerMB===null ? g.length*2.5 : procSecsPerMB*gBytes/1e6;
             current=gBytes*SEND_SHARE; phase(`Watermarking ${range} on the server…`);
           }
@@ -309,10 +332,17 @@ async function start(all){
         sending=false; procStart=0;
         break;
       }catch(err){
-        if(attempt===3){ log(`Batch ${gi+1} failed after 3 tries (${err.message}). Those ${g.length} photos were skipped — import the folder again later to add them; nothing is duplicated.`); }
-        else{ sending=false; procStart=0; phase(`Connection problem — retrying ${range} (try ${attempt+1} of 3)…`,'bad'); await new Promise(r=>setTimeout(r,2000*attempt)); }
+        sending=false; procStart=0;
+        if(err.status===507){ stopped=err.message; break; }
+        const transient=!err.status||[502,503,504,500].includes(err.status);
+        const tries = err.status===500 ? 3 : WAITS.length+1;
+        if(!transient || attempt>=tries){ log(`Photos ${range.replace('photos ','')} couldn't be uploaded (${err.message}). Import the folder again later to add them — nothing is duplicated.`); break; }
+        const wait=WAITS[attempt-1];
+        phase(err.status ? `The server is restarting or busy — trying ${range} again in ${wait} s…` : `Connection lost — trying ${range} again in ${wait} s…`,'bad');
+        await new Promise(r=>setTimeout(r,wait*1000));
       }
     }
+    if(stopped){ failed+=files.length-done; break; }
     current=0; doneBytes+=gBytes; done+=g.length; lastTick=Date.now();
     if(data){
       batches.push(data.batchId); staged.push(...data.staged);
@@ -323,13 +353,17 @@ async function start(all){
     paint();
   }
   clearInterval(stallTimer); uploading=false; sending=false; procStart=0; $('stall').hidden=true; keepAwake(false);
+  if(stopped){
+    showBlocker('Upload stopped — the server is out of storage space', stopped
+      +(staged.length?` The ${staged.length} photos that did upload are kept below; you can publish them now and import the rest after adding storage.`:''));
+  }
   document.title='✓ Upload finished · '+BASE_TITLE;
   $('guide').className='guide done';
   $('guide').innerHTML="<span class=\"h\">Upload finished — one more step.</span>Check the names below and press <b>Publish</b>. Until you do, parents can't see these photos — and if you leave before publishing, you'd need to upload them again.";
   $('eta').textContent=`Done in ${fmtTime((Date.now()-t0)/1000)}`;
   phase(`Uploaded ${staged.length} photo${staged.length===1?'':'s'} for ${schoolName}`+(failed?` — ${failed} could not be uploaded`:''),'off');
   $('pct').textContent='100%'; $('bar').style.width='100%';
-  if(failed) log(failed+' file(s) were not imported (unreadable, not a photo, or the connection dropped).');
+  if(failed && !stopped) log(failed+' file(s) were not imported (unreadable, not a photo, or the connection dropped).');
   if(!staged.length){
     phase('Nothing could be uploaded. Check your connection and try again.','bad');
     drop.hidden=false; document.querySelector('.example').hidden=false; batches=[]; return;

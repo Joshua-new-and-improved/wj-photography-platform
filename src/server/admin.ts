@@ -5,6 +5,7 @@ import { formatRands, randsInputValue } from "../lib/commerce/money.js";
 import { getObject, publicUrl } from "../lib/storage/local.js";
 import { settleOrder, saveYocoKey, yocoStatus, publicOrigin } from "./payments.js";
 import { rlsEnforcedForParents } from "./parent-auth.js";
+import { diskStatus, sweepOrphans } from "./storage-health.js";
 import { issueClaimCode } from "../lib/claim.js";
 import QRCode from "qrcode";
 
@@ -114,6 +115,21 @@ function productionChip(o: { payment_status: string; fulfilment_status: string; 
   }
 }
 
+const gb = (b: number) => (b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : Math.round(b / 1e6) + " MB");
+
+function storagePanel(d: Awaited<ReturnType<typeof diskStatus>>): string {
+  if (!d) return `<p class="muted">Storage size couldn't be read.</p>`;
+  const tone = d.usedPct >= 90 ? "bad" : d.usedPct >= 75 ? "warn" : "ok";
+  // A full-resolution school photo is ~8–12 MB with its previews.
+  const photosLeft = Math.max(0, Math.floor(d.freeBytes / 10e6));
+  return `<div class="storebar ${tone}"><i style="width:${Math.min(100, d.usedPct)}%"></i></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:8px 0 12px">
+      ${chip(`${d.usedPct}% used`, tone)} <span>${gb(d.usedBytes)} of ${gb(d.totalBytes)} · ${gb(d.freeBytes)} free</span>
+      <span class="muted">≈ room for ${photosLeft.toLocaleString("en-ZA")} more photos</span></div>
+    ${d.usedPct >= 75 ? `<p class="sub" style="margin:0 0 12px">A typical school takes several GB. To add space: Railway → project → <b>precious-joy-volume</b> → Settings → size (larger sizes need a paid Railway plan).</p>` : ""}
+    <form method="post" action="/admin/storage/sweep" class="inline"><button class="btn small ghost" type="submit">Free up space from failed uploads</button></form>`;
+}
+
 const when = (d: Date | string) =>
   new Date(d).toLocaleDateString("en-ZA", { day: "numeric", month: "short", timeZone: "Africa/Johannesburg" });
 
@@ -195,6 +211,8 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
     else if (yoco.mode === "test") todo.push(t("/admin/settings", "Yoco is in test mode — switch to your live key to take real payments"));
     if (Number(c.no_code)) todo.push(t("/admin/schools", `<b>${c.no_code}</b> child${c.no_code == 1 ? " has" : "ren have"} no claim card yet`));
     if (Number(c.pkg_no_contents)) todo.push(t("/admin/catalogue#packages", `<b>${c.pkg_no_contents}</b> package${c.pkg_no_contents == 1 ? " has" : "s have"} no contents ticked`));
+    const disk = await diskStatus();
+    if (disk && disk.usedPct >= 75) todo.unshift(t("/admin/settings", `Photo storage is <b>${disk.usedPct}% full</b> (${gb(disk.freeBytes)} free) — increase it before the next import`));
     if (!todo.length) todo.push(`<li><div><span class="dot ok"></span>All caught up — nothing needs you right now.</div></li>`);
 
     const claimedPct = Number(c.children) ? Math.round((Number(c.claimed) / Number(c.children)) * 100) : 0;
@@ -909,6 +927,7 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
       active: "settings",
       body: `
       <section class="panel"><h2>Card payments (Yoco)</h2>${paymentsPanel(yoco)}</section>
+      <section class="panel" id="storage"><h2>Photo storage</h2>${storagePanel(await diskStatus())}</section>
       <section class="panel"><h2>System</h2>
         <dl class="kv">
           <dt>Website</dt><dd>${escapeHtml(publicOrigin() ?? "local")}</dd>
@@ -918,6 +937,17 @@ export function registerAdmin(app: express.Express, deps: AdminDeps): void {
         </dl>
       </section>`,
     });
+  });
+
+  app.post("/admin/storage/sweep", async (_req, res) => {
+    try {
+      const r = await sweepOrphans(pool);
+      backTo(res, "/admin/settings#storage", { saved: r.deleted
+        ? `Freed ${gb(r.freedBytes)} (${r.deleted} unused files from failed or abandoned uploads).`
+        : "Nothing to free — every stored file belongs to a photo." });
+    } catch (err) {
+      backTo(res, "/admin/settings#storage", { error: "Cleanup stopped safely: " + (err as Error).message });
+    }
   });
 
   app.post("/admin/payments", async (req, res) => {

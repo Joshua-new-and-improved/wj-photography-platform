@@ -135,6 +135,9 @@ ${ORDER_ROWS_CSS(".dtable.list")}
   .dtable.kids .k-act .btn{width:100%}
 }
 .nowrap{white-space:nowrap}
+.storebar{height:12px;border-radius:99px;background:#EFEDE8;overflow:hidden}
+.storebar i{display:block;height:100%;background:var(--green)}
+.storebar.warn i{background:#C77700}.storebar.bad i{background:var(--chinagraph)}
 .k-sm{display:none}
 @media (max-width:700px){.k-sm{display:inline}}
 body.admin{display:grid;grid-template-columns:232px 1fr;min-height:100vh;background:#F4F2EE}
