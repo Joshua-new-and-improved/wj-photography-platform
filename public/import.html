@@ -34,7 +34,24 @@ h1{font-family:var(--display);font-size:clamp(24px,4vw,32px);letter-spacing:-.03
 .example{font-family:var(--mono);font-size:12px;color:#5D6068;background:#FAF9F6;border-radius:8px;padding:12px 14px;margin-top:14px;line-height:1.7}
 .progress{height:10px;background:#EFEDE8;border-radius:99px;overflow:hidden;margin:12px 0 6px}
 .progress i{display:block;height:100%;width:0;background:var(--green);transition:width .3s}
-.pmsg{font-size:14px;color:#5D6068}
+.pmsg{font-size:14px;color:#5D6068;display:flex;align-items:center;gap:8px}
+.ptop{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-top:4px}
+.pct{font-family:var(--display);font-size:30px;letter-spacing:-.02em}
+.eta{font-size:15px;font-weight:600;text-align:right}
+.pstats{display:flex;flex-wrap:wrap;gap:4px 16px;font-family:var(--mono);font-size:12.5px;color:#5D6068;margin:6px 0 10px}
+.pulse{width:8px;height:8px;border-radius:99px;background:var(--green);flex:none;animation:pulse 1.2s ease-in-out infinite}
+.pulse.off{animation:none;background:var(--silver)}
+.pulse.bad{background:var(--chinagraph)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.stall{margin-top:10px;padding:10px 12px;border-radius:8px;background:#FBEBD5;color:#8A5200;font-size:14px}
+.guide{margin-top:12px;padding:12px 14px;border-radius:8px;background:#F0F7F4;color:#1F4D3B;font-size:14px;line-height:1.5}
+.guide .h{display:block;font-weight:700;margin-bottom:2px}
+.guide.done{background:#FAF9F6;color:var(--graphite)}
+.arrived{margin-top:14px}
+.arrived-label{font-size:12px;color:var(--silver);margin-bottom:6px}
+.arrived-strip{display:flex;gap:6px;overflow:hidden}
+.arrived-strip img{width:44px;height:66px;object-fit:cover;border-radius:4px;border:1px solid var(--rule);flex:none;animation:pop .3s}
+@keyframes pop{from{transform:scale(.7);opacity:0}to{transform:none;opacity:1}}
 .log{font-family:var(--mono);font-size:12px;color:#5D6068;white-space:pre-wrap;max-height:160px;overflow:auto;margin-top:10px}
 .summary{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));margin-bottom:14px}
 .summary div{background:#FAF9F6;border-radius:8px;padding:12px}
@@ -82,8 +99,13 @@ h1{font-family:var(--display);font-size:clamp(24px,4vw,32px);letter-spacing:-.03
     </label>
     <div class="example">School name/<br>&nbsp;&nbsp;Grade R/<br>&nbsp;&nbsp;&nbsp;&nbsp;Class A/<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Zané du Toit/&nbsp;&nbsp;IMG_0412.jpg …</div>
     <div id="progressBox" hidden>
-      <div class="progress"><i id="bar"></i></div>
-      <div class="pmsg" id="pmsg"></div>
+      <div class="ptop"><span class="pct" id="pct">0%</span><span class="eta" id="eta">Starting…</span></div>
+      <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="pbar"><i id="bar"></i></div>
+      <div class="pstats" id="pstats"></div>
+      <div class="pmsg" id="pmsg"><span class="pulse"></span><span id="phase">Preparing…</span></div>
+      <div class="stall" id="stall" hidden></div>
+      <div class="guide" id="guide"></div>
+      <div class="arrived" id="arrivedWrap" hidden><div class="arrived-label">Arrived on the server</div><div class="arrived-strip" id="arrived"></div></div>
     </div>
     <div class="log" id="log" hidden></div>
   </section>
@@ -114,8 +136,9 @@ const $=id=>document.getElementById(id);
 const api=p=>location.origin+p;
 const IMG=/\.(jpe?g|png|heic|heif|tiff?|webp)$/i;
 // Small batches: a whole school in one request can run past timeouts and
-// memory limits. ~40 MB or 25 files per request, whichever comes first.
-const MAX_BATCH_BYTES=40*1024*1024, MAX_BATCH_FILES=25;
+// memory limits, and small batches keep the progress moving. ~30 MB or 8
+// photos per request, whichever comes first.
+const MAX_BATCH_BYTES=30*1024*1024, MAX_BATCH_FILES=8;
 let batches=[], staged=[], schoolId=null, schoolName='', lastName='', showAll=false;
 
 function log(m){ const l=$('log'); l.hidden=false; l.textContent+=(l.textContent?'\n':'')+m; l.scrollTop=1e9; }
@@ -137,6 +160,63 @@ drop.addEventListener('drop', async e=>{
 });
 $('fileInput').onchange=e=>start([...e.target.files].map(f=>({file:f,path:f.webkitRelativePath||f.name})));
 
+let uploading=false;
+window.addEventListener('beforeunload',e=>{ if(uploading){ e.preventDefault(); e.returnValue=''; } });
+
+/** POST one batch, reporting bytes as the browser sends them (fetch can't). */
+function send(fd,onProgress){
+  return new Promise((resolve,reject)=>{
+    const x=new XMLHttpRequest();
+    x.open('POST',api('/api/import/upload'));
+    x.responseType='json';
+    x.timeout=15*60*1000;
+    x.upload.onprogress=e=>{ if(e.lengthComputable) onProgress(e.loaded,e.total); };
+    x.upload.onload=()=>onProgress(null,null);           // all bytes sent; server is processing
+    x.onload=()=>{ const r=x.response||{}; x.status>=200&&x.status<300 ? resolve(r) : reject(new Error(r.error||('server said '+x.status))); };
+    x.onerror=()=>reject(new Error('connection lost'));
+    x.ontimeout=()=>reject(new Error('timed out'));
+    x.send(fd);
+  });
+}
+const mb=b=>b>=1e9?(b/1e9).toFixed(2)+' GB':(b/1e6).toFixed(b>=1e8?0:1)+' MB';
+function fmtTime(s){ s=Math.round(s); if(s<60) return s+' s'; const m=Math.floor(s/60); if(m<60) return m+' min '+(s%60)+' s'; return Math.floor(m/60)+' h '+(m%60)+' min'; }
+const PHONE=matchMedia('(pointer:coarse)').matches && innerWidth<900;
+/** What the person can do while they wait — the honest answer, then the nice part. */
+function guideText(secsLeft,frac){
+  const stay = PHONE
+    ? "<span class=\"h\">Keep this page open and your screen on.</span>Stay in this browser — phones pause uploads when you switch to another app or lock the screen."
+    : "<span class=\"h\">You can carry on with other work.</span>Switch to other tabs or programs freely — the upload keeps going. Just don't close this tab, refresh it, or let the computer go to sleep.";
+  let treat;
+  if(secsLeft===null) treat="Working out how long this will take…";
+  else if(secsLeft<60 && frac>0.8) treat="Almost done — no need to go anywhere.";
+  else if(secsLeft<60) treat="Not long now — hang tight.";
+  else if(secsLeft<5*60) treat="☕ Just enough time to make a coffee.";
+  else if(secsLeft<20*60) treat="☕ Good time for a coffee break — we'll keep going.";
+  else treat="☕ This is a big one. Make a full pot — progress is saved batch by batch, so nothing is lost if the connection hiccups.";
+  return stay+'<br>'+treat;
+}
+let wakeLock=null;
+async function keepAwake(on){
+  try{
+    if(on && 'wakeLock' in navigator && !wakeLock){ wakeLock=await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release',()=>{wakeLock=null;}); }
+    if(!on && wakeLock){ await wakeLock.release(); wakeLock=null; }
+  }catch(e){ /* not supported or not allowed — the message above covers it */ }
+}
+document.addEventListener('visibilitychange',()=>{ if(uploading && document.visibilityState==='visible') keepAwake(true); });
+const BASE_TITLE=document.title;
+
+function leftText(s){
+  if(s<20) return 'A few seconds left';
+  if(s<60) return 'Under a minute left';
+  const m=Math.round(s/60); if(m<60) return 'About '+m+' min left';
+  return 'About '+Math.floor(m/60)+' h '+(m%60)+' min left';
+}
+function showArrived(list){
+  const strip=$('arrived'); $('arrivedWrap').hidden=false;
+  list.slice(-8).forEach(s=>{ const i=new Image(); i.src=s.thumbUrl; i.alt=''; strip.prepend(i); });
+  while(strip.children.length>12) strip.lastChild.remove();
+}
+
 async function start(all){
   const files=all.filter(f=>IMG.test(f.path) && !f.path.split('/').some(p=>p.startsWith('.')));
   if(!files.length){ log('No photos found in that folder.'); return; }
@@ -151,31 +231,107 @@ async function start(all){
   }
   if(cur.length) groups.push(cur);
 
-  let done=0, failed=0;
-  for(const g of groups){
-    $('pmsg').textContent=`Uploading and watermarking… ${done} of ${files.length} photos`;
+  // ── Live progress ────────────────────────────────────────────────────
+  // Bytes are the honest measure: a batch of 25 photos takes as long to send
+  // as its size, and the server then watermarks it. The bar moves with every
+  // chunk the browser sends; the time left comes from the average speed so
+  // far (sending + server work), so it settles after the first batch.
+  // Each batch's share of the bar is split: 55% for sending its bytes, 45%
+  // for the server watermarking them. While the server works, the bar
+  // advances on the time earlier batches took per MB, so it never sits
+  // frozen and the time left includes the server's part.
+  const totalBytes=files.reduce((n,f)=>n+f.file.size,0);
+  const SEND_SHARE=0.55;
+  let doneBytes=0, done=0, failed=0, lastTick=Date.now(), current=0;
+  let procStart=0, procExpect=0, procSecsPerMB=null, gBytesNow=0, sending=false;
+  let netBytes=0, netSecs=0, lastLoaded=0, lastAt=0;   // upload speed, measured only while bytes are moving
+  const t0=Date.now();
+  uploading=true; keepAwake(true);
+  const stallTimer=setInterval(()=>{
+    if(sending){
+      const quiet=(Date.now()-lastTick)/1000;
+      $('stall').hidden=quiet<20;
+      if(quiet>=20) $('stall').textContent=`Nothing has been sent for ${Math.round(quiet)} seconds. Check the internet connection — it keeps trying, and photos already uploaded are safe.`;
+    }else if(procStart){
+      const busy=(Date.now()-procStart)/1000;
+      $('stall').hidden=busy<180;
+      if(busy>=180) $('stall').textContent=`The server has been working on this batch for ${fmtTime(busy)}. Large photos take longer — it's still going.`;
+      current=gBytesNow*(SEND_SHARE+(1-SEND_SHARE)*Math.min(0.95,(Date.now()-procStart)/1000/Math.max(procExpect,1)));
+      const p=$('phase'); p.textContent=p.textContent.replace(/ \(\d.*\)…$|…$/,'')+` (${fmtTime(busy)})…`;
+    }
+    paint();
+  },1000);
+  function paint(){
+    const sent=doneBytes+current, frac=totalBytes?Math.min(1,sent/totalBytes):0;
+    const pct=Math.floor(frac*100);
+    $('pct').textContent=pct+'%'; $('bar').style.width=(frac*100).toFixed(1)+'%'; $('pbar').setAttribute('aria-valuenow',pct);
+    const secs=(Date.now()-t0)/1000, rate=netSecs>1?netBytes/netSecs:0;
+    const sentBytes=Math.min(totalBytes,doneBytes+(sending?current/SEND_SHARE:gBytesNow*(procStart?1:0)));
+    $('pstats').innerHTML=`<span>${done} of ${files.length} photos ready</span><span>${mb(sentBytes)} of ${mb(totalBytes)} sent</span>`
+      +(rate>0?`<span>↑ ${mb(rate)}/s</span>`:'')+`<span>${fmtTime(secs)} elapsed</span>`;
+    let left=null;
+    if(frac>=1) $('eta').textContent='Finishing…';
+    else if(secs<4||frac<0.02) $('eta').textContent='Working out time left…';
+    else { left=secs/frac*(1-frac); $('eta').textContent=leftText(left); }
+    $('guide').innerHTML=guideText(frac>=1?0:left,frac);
+    document.title=`${pct}% uploaded · ${BASE_TITLE}`;
+  }
+  function phase(text,state){ $('phase').textContent=text; $('pmsg').querySelector('.pulse').className='pulse'+(state?' '+state:''); }
+
+  for(let gi=0;gi<groups.length;gi++){
+    const g=groups[gi], gBytes=g.reduce((n,f)=>n+f.file.size,0);
+    const range=`photos ${done+1}–${done+g.length}`;
     const fd=new FormData();
     g.forEach(f=>{ fd.append('files',f.file); fd.append('relativePaths',f.path); });
-    let data;
+    let data=null;
+    gBytesNow=gBytes;
     for(let attempt=1;attempt<=3;attempt++){
+      current=0; lastTick=Date.now(); sending=true; procStart=0; lastLoaded=0; lastAt=0;
+      phase(`Sending ${range}…`);
       try{
-        const r=await fetch(api('/api/import/upload'),{method:'POST',body:fd});
-        data=await r.json(); if(!r.ok) throw new Error(data.error||r.status);
+        data=await send(fd,(loaded,total)=>{
+          if(loaded===null){
+            sending=false; procStart=Date.now(); $('stall').hidden=true;
+            // First batch: assume ~2.5 s per photo; afterwards, measured.
+            procExpect=procSecsPerMB===null ? g.length*2.5 : procSecsPerMB*gBytes/1e6;
+            current=gBytes*SEND_SHARE; phase(`Watermarking ${range} on the server…`);
+          }
+          else{
+            const now=Date.now();
+            if(lastAt && loaded>=lastLoaded){ netBytes+=(loaded-lastLoaded)/total*gBytes; netSecs+=(now-lastAt)/1000; }
+            lastLoaded=loaded; lastAt=now;
+            current=gBytes*SEND_SHARE*Math.min(1,loaded/total);
+          }
+          lastTick=Date.now(); paint();
+        });
+        if(procStart){ const took=(Date.now()-procStart)/1000, m=gBytes/1e6;
+          procSecsPerMB = procSecsPerMB===null ? took/m : procSecsPerMB*0.5+(took/m)*0.5; }
+        sending=false; procStart=0;
         break;
-      }catch(err){ data=null; if(attempt===3) log('A batch failed after 3 tries: '+err.message); else await new Promise(r=>setTimeout(r,1500*attempt)); }
+      }catch(err){
+        if(attempt===3){ log(`Batch ${gi+1} failed after 3 tries (${err.message}). Those ${g.length} photos were skipped — import the folder again later to add them; nothing is duplicated.`); }
+        else{ sending=false; procStart=0; phase(`Connection problem — retrying ${range} (try ${attempt+1} of 3)…`,'bad'); await new Promise(r=>setTimeout(r,2000*attempt)); }
+      }
     }
+    current=0; doneBytes+=gBytes; done+=g.length; lastTick=Date.now();
     if(data){
       batches.push(data.batchId); staged.push(...data.staged);
       schoolId=data.schoolId; schoolName=data.schoolName;
       failed+=g.length-data.staged.length;
+      showArrived(data.staged);
     }else failed+=g.length;
-    done+=g.length;
-    $('bar').style.width=Math.round(done/files.length*100)+'%';
+    paint();
   }
-  $('pmsg').textContent=`Uploaded ${staged.length} photo${staged.length===1?'':'s'} for ${schoolName}`+(failed?` — ${failed} could not be read`:'');
-  if(failed) log(failed+' file(s) were skipped (unreadable or not a photo).');
+  clearInterval(stallTimer); uploading=false; sending=false; procStart=0; $('stall').hidden=true; keepAwake(false);
+  document.title='✓ Upload finished · '+BASE_TITLE;
+  $('guide').className='guide done';
+  $('guide').innerHTML="<span class=\"h\">Upload finished — one more step.</span>Check the names below and press <b>Publish</b>. Until you do, parents can't see these photos — and if you leave before publishing, you'd need to upload them again.";
+  $('eta').textContent=`Done in ${fmtTime((Date.now()-t0)/1000)}`;
+  phase(`Uploaded ${staged.length} photo${staged.length===1?'':'s'} for ${schoolName}`+(failed?` — ${failed} could not be uploaded`:''),'off');
+  $('pct').textContent='100%'; $('bar').style.width='100%';
+  if(failed) log(failed+' file(s) were not imported (unreadable, not a photo, or the connection dropped).');
   if(!staged.length){
-    $('pmsg').innerHTML='<span class="err">Nothing could be uploaded. Check your connection and try again.</span>';
+    phase('Nothing could be uploaded. Check your connection and try again.','bad');
     drop.hidden=false; document.querySelector('.example').hidden=false; batches=[]; return;
   }
   step(2); review();

@@ -1411,13 +1411,29 @@ app.post("/api/import/upload", upload.array("files"), async (req, res) => {
       autoMatchedName: string | null;
     }> = [];
 
+    // Watermarking and resizing is the slow part (~2 s a photo). Do up to
+    // three at once; everything that touches the database below stays
+    // strictly sequential so two photos of the same child can never race to
+    // create that child twice.
+    const DERIVE_CONCURRENCY = 3;
+    const derived: Array<Promise<Awaited<ReturnType<typeof deriveVariants>>>> = new Array(files.length);
+    let nextIdx = 0;
+    const startNext = (): void => {
+      const i = nextIdx++;
+      if (i >= files.length) return;
+      derived[i] = deriveVariants(files[i]!.buffer, { watermarkText: "Wiaan Jordaan Photography" });
+      derived[i]!.catch(() => {}).finally(startNext);
+    };
+    for (let k = 0; k < DERIVE_CONCURRENCY; k++) startNext();
+
     for (let i = 0; i < files.length; i++) {
       const f = files[i]!;
       const relativePath = relPaths[i] ?? f.originalname;
 
       let source, variants;
       try {
-        ({ source, variants } = await deriveVariants(f.buffer, { watermarkText: "Wiaan Jordaan Photography" }));
+        while (!derived[i]) await new Promise((r) => setImmediate(r));
+        ({ source, variants } = await derived[i]!);
       } catch (err) {
         await pool.query(
           `insert into import_file (studio_id, import_batch_id, relative_path, file_name, bytes, status, failure_reason)
