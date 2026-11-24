@@ -69,9 +69,15 @@ async function main() {
 
   try {
     const commit = await (await staff(`/api/import/${up.batchId}/commit`, { method: "POST" })).json() as any;
-    const codeFor = (name: string) => commit.claimCodes.find((c: any) => c.child.startsWith(name))?.grouped as string;
+    check("import published", commit.committed === 3, JSON.stringify(commit));
+    // Codes are issued by the claim-card page, the way Wiaan prints them.
+    const cards = await (await staff(`/admin/cards/${schoolId}`)).text();
+    const codeFor = (name: string) =>
+      cards.match(new RegExp(`data-child="${name}[^"]*" data-code="([0-9A-Z-]+)"`))?.[1] as string;
     const codeA = codeFor("Alice"), codeB = codeFor("Bongani");
-    check("import issued a code per child", !!codeA && !!codeB, JSON.stringify(commit.claimCodes));
+    check("claim-card page issued a card per child", !!codeA && !!codeB);
+    const again = await (await staff(`/admin/cards/${schoolId}`)).text();
+    check("reopening the card page does not replace printed cards", !again.includes(codeA) && !/data-code=/.test(again));
 
     // ── Claim ───────────────────────────────────────────────────────────────
     const A = new Browser("A"), B = new Browser("B"), C = new Browser("C"), anon = new Browser("anon");
@@ -192,11 +198,12 @@ async function main() {
         await db.end();
       }
     } else {
-      const admin = await (await staff(`/admin?school=${schoolId}`)).text();
-      const idx = admin.indexOf(order.orderNumber);
-      const m = admin.slice(idx).match(/\/admin\/order\/([0-9a-f-]+)\/mark-paid/);
-      check("admin lists the order", idx >= 0 && !!m);
-      if (m) await staff(`/admin/order/${m[1]}/mark-paid`, { method: "POST" });
+      const list = await (await staff(`/admin/orders?q=${encodeURIComponent(order.orderNumber)}`)).text();
+      const m = list.match(/\/admin\/orders\/([0-9a-f-]{36})/);
+      check("admin finds the order by number", !!m);
+      if (m) await staff(`/admin/order/${m[1]}/mark-paid`, {
+        method: "POST", body: new URLSearchParams({ method: "manual_eft", ref: "e2e" }),
+        headers: { "content-type": "application/x-www-form-urlencoded" } });
     }
 
     const paidPage = await (await A.req(`/order/${order.orderNumber}`)).text();

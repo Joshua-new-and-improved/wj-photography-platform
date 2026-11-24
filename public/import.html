@@ -3,204 +3,241 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Import test — Wiaan Jordaan Photography</title>
+<title>Import photos — Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root{--paper:#FBFAF7;--graphite:#1C1D21;--silver:#8A8D94;--rule:#DFDCD5;--chinagraph:#D4212B;--green:#12694A}
+:root{--paper:#FBFAF7;--graphite:#1C1D21;--silver:#8A8D94;--rule:#DFDCD5;--chinagraph:#D4212B;--green:#12694A;
+  --display:'Archivo Black',system-ui,sans-serif;--body:'Archivo',system-ui,sans-serif;--mono:'IBM Plex Mono',ui-monospace,monospace}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--paper);color:var(--graphite);font-family:system-ui,sans-serif;padding:24px;max-width:1000px;margin:0 auto}
-h1{font-size:20px;margin-bottom:4px}
-.lead{color:var(--silver);font-size:13.5px;margin-bottom:20px;line-height:1.5}
-.drop{border:2px dashed var(--rule);border-radius:6px;padding:40px 20px;text-align:center;
-  cursor:pointer;background:#fff;margin-bottom:16px}
-.drop.over{border-color:var(--graphite);background:#f3f2ee}
+body{background:#F4F2EE;color:var(--graphite);font-family:var(--body);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:inherit}
+.top{background:var(--graphite);color:#fff;padding:12px clamp(16px,3vw,32px);display:flex;align-items:center;gap:14px}
+.top .mark{font-family:var(--display);font-size:15px;letter-spacing:-.03em;text-decoration:none}
+.top .mark small{display:block;font-family:var(--mono);font-size:9px;letter-spacing:.2em;color:#8f9198;font-weight:400}
+.top .back{margin-left:auto;font-size:14px;color:#C9C7C2;text-decoration:none}
+.top .back:hover{color:#fff}
+main{max-width:1100px;margin:0 auto;padding:24px clamp(16px,3vw,32px) 80px}
+h1{font-family:var(--display);font-size:clamp(24px,4vw,32px);letter-spacing:-.03em;margin-bottom:6px}
+.lead{color:#5D6068;max-width:680px;margin-bottom:20px}
+.panel{background:#fff;border:1px solid var(--rule);border-radius:10px;padding:18px;margin-bottom:16px}
+.steps{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.steps span{font-size:13px;padding:6px 12px;border-radius:99px;background:#fff;border:1px solid var(--rule);color:var(--silver)}
+.steps span.on{background:var(--graphite);border-color:var(--graphite);color:#fff}
+.steps span.done{border-color:var(--green);color:var(--green)}
+.drop{display:block;border:2px dashed var(--rule);border-radius:10px;padding:44px 20px;text-align:center;cursor:pointer;background:#FAF9F6;transition:.15s}
+.drop:hover,.drop.over{border-color:var(--graphite);background:#F1EFEA}
 .drop input{display:none}
-.drop p{font-size:14px;color:var(--silver)}
-.drop b{color:var(--graphite)}
-.status{font-family:ui-monospace,monospace;font-size:12.5px;color:var(--silver);
-  background:#fff;border:1px solid var(--rule);border-radius:4px;padding:12px;margin-bottom:16px;
-  white-space:pre-wrap;max-height:180px;overflow:auto}
-.grid{display:grid;gap:6px;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));margin-bottom:20px}
-.card{background:#fff;border:1px solid var(--rule);border-radius:4px;overflow:hidden}
+.drop b{display:block;font-size:17px;margin-bottom:4px}
+.drop p{color:var(--silver);font-size:14px}
+.example{font-family:var(--mono);font-size:12px;color:#5D6068;background:#FAF9F6;border-radius:8px;padding:12px 14px;margin-top:14px;line-height:1.7}
+.progress{height:10px;background:#EFEDE8;border-radius:99px;overflow:hidden;margin:12px 0 6px}
+.progress i{display:block;height:100%;width:0;background:var(--green);transition:width .3s}
+.pmsg{font-size:14px;color:#5D6068}
+.log{font-family:var(--mono);font-size:12px;color:#5D6068;white-space:pre-wrap;max-height:160px;overflow:auto;margin-top:10px}
+.summary{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));margin-bottom:14px}
+.summary div{background:#FAF9F6;border-radius:8px;padding:12px}
+.summary b{display:block;font-family:var(--display);font-size:22px}
+.summary span{font-size:12.5px;color:var(--silver)}
+.grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));margin:12px 0}
+@media (max-width:520px){.grid{grid-template-columns:repeat(2,1fr)}}
+.card{background:#fff;border:1px solid var(--rule);border-radius:8px;overflow:hidden}
 .card img{width:100%;aspect-ratio:2/3;object-fit:cover;display:block;background:#eee}
-.card .tag{padding:8px;font-size:11px}
-.card .tag input{width:100%;padding:5px 6px;border:1px solid var(--rule);border-radius:3px;
-  font-size:12px;margin-bottom:4px}
-.card .tag button{width:100%;padding:6px;border:1px solid var(--graphite);border-radius:3px;
-  background:none;font-size:11px;cursor:pointer}
+.card .tag{padding:8px;font-size:13px}
+.card .tag input{width:100%;padding:8px;border:1px solid var(--rule);border-radius:6px;font:inherit;font-size:14px;margin-bottom:5px}
+.card .tag button{width:100%;padding:8px;border:1px solid var(--graphite);border-radius:6px;background:#fff;font:inherit;font-size:13px;font-weight:600;cursor:pointer}
 .card.done{border-color:var(--green)}
-.card.done .tag{background:#f0f7f4}
-.btn{background:var(--graphite);color:var(--paper);padding:10px 18px;border:none;
-  border-radius:4px;font-size:14px;cursor:pointer;font-weight:600}
+.card.done .tag{background:#F0F7F4}
+.ok{color:var(--green);font-size:12px}
+.btn{display:inline-block;background:var(--graphite);color:#fff;padding:11px 18px;border:0;border-radius:8px;font:inherit;font-weight:600;font-size:15px;cursor:pointer;text-decoration:none;text-align:center}
 .btn:disabled{opacity:.35;cursor:not-allowed}
-.codes{background:#fff;border:1px solid var(--rule);border-radius:4px;padding:16px;margin-top:16px}
-.codes h3{font-size:14px;margin-bottom:10px}
-.codes div{font-family:ui-monospace,monospace;font-size:13px;padding:5px 0;border-bottom:1px solid var(--rule)}
-.step{font-weight:600;font-size:12px;color:var(--chinagraph);text-transform:uppercase;
-  letter-spacing:.06em;margin-bottom:6px}
+.btn.ghost{background:#fff;color:var(--graphite);border:1px solid var(--rule)}
+.btn.green{background:var(--green)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.codes{display:grid;gap:6px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));margin:12px 0}
+.codes div{background:#FAF9F6;border-radius:8px;padding:10px 12px;font-size:14px}
+.codes b{display:block;font-family:var(--mono);font-size:15px;letter-spacing:.06em}
+.err{color:var(--chinagraph)}
+[hidden]{display:none!important}
 </style>
 </head>
 <body>
-<h1>Import test</h1>
-<p class="lead">Drop the school folder here to run it through the real pipeline: folder parsing,
-  GPS stripping, watermarking, slate-card segmentation (or manual tagging if none were used),
-  and claim-code generation. Nothing here is a mock — this hits Postgres and writes real files
-  to <code>storage/</code>.</p>
+<header class="top">
+  <a class="mark" href="/admin">WIAAN JORDAAN<small>STUDIO</small></a>
+  <a class="back" href="/admin">← Back to the studio</a>
+</header>
+<main>
+  <h1>Import photos</h1>
+  <p class="lead">Choose a school's folder. The school, grades, classes and children are read from the folder
+    names — nothing to type. Importing more photos for a school later is safe: cards already handed out keep working.</p>
 
-<div class="step" id="stepLabel">Step 1 — upload</div>
-<div class="drop" id="drop">
-  <input type="file" id="fileInput" webkitdirectory directory multiple>
-  <p><b>Click to choose a folder</b> or drag one here.<br>Needs "Allow folder upload" in some browsers.</p>
-</div>
-<div class="status" id="status">Waiting for a folder…</div>
+  <div class="steps"><span id="s1" class="on">1 · Upload</span><span id="s2">2 · Check names</span><span id="s3">3 · Publish &amp; print cards</span></div>
 
-<div id="tagStep" style="display:none">
-  <div class="step">Step 2 — tag each photo</div>
-  <p class="lead">No slate cards in this batch, so every photo needs a name. Type it once — the
-    same name reuses the same child and the same claim code.</p>
-  <div class="grid" id="grid"></div>
-  <button class="btn" id="commitBtn" disabled>Commit and generate claim codes</button>
-</div>
+  <section class="panel" id="uploadPanel">
+    <label class="drop" id="drop">
+      <input type="file" id="fileInput" webkitdirectory directory multiple>
+      <b>Choose the school folder</b>
+      <p>or drag it here from Finder / Explorer</p>
+    </label>
+    <div class="example">School name/<br>&nbsp;&nbsp;Grade R/<br>&nbsp;&nbsp;&nbsp;&nbsp;Class A/<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Zané du Toit/&nbsp;&nbsp;IMG_0412.jpg …</div>
+    <div id="progressBox" hidden>
+      <div class="progress"><i id="bar"></i></div>
+      <div class="pmsg" id="pmsg"></div>
+    </div>
+    <div class="log" id="log" hidden></div>
+  </section>
 
-<div id="codesBox" style="display:none" class="codes">
-  <h3>Done — claim codes issued</h3>
-  <div id="codesList"></div>
-  <p class="lead" style="margin-top:12px">Each code is one-time and hashed in the database — this
-    list is the only place the plaintext exists, so print the cards now.</p>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
-    <a id="cardsLink" href="#" class="btn" style="display:inline-block;text-decoration:none">
-      Print QR cards for this school →</a>
-    <a id="adminLink" href="/admin" class="btn" style="display:inline-block;text-decoration:none;
-       background:none;color:var(--graphite);border:1px solid var(--graphite)">Open the studio dashboard</a>
-  </div>
-</div>
+  <section class="panel" id="reviewPanel" hidden>
+    <div class="summary" id="summary"></div>
+    <p class="lead" id="tagHint" hidden style="margin-bottom:6px">Some photos weren't inside a child's folder. Type a name for each — the same name joins the same child.</p>
+    <div class="row" style="margin-bottom:6px">
+      <button class="btn ghost" id="toggleAll" type="button">Show all photos</button>
+    </div>
+    <div class="grid" id="grid"></div>
+    <button class="btn green" id="commitBtn" disabled>Publish galleries</button>
+  </section>
 
+  <section class="panel" id="donePanel" hidden>
+    <h1 style="font-size:24px">Published</h1>
+    <p class="lead" id="doneMsg"></p>
+    <div class="row">
+      <a id="cardsLink" href="/admin/cards" class="btn">Print claim cards →</a>
+      <a id="schoolLink" href="/admin/schools" class="btn ghost">Open the school</a>
+      <a href="/import.html" class="btn ghost">Import another folder</a>
+    </div>
+  </section>
+</main>
 <script>
 const $=id=>document.getElementById(id);
-let batchId=null, staged=[], lastName='', schoolId=null;
+// Absolute URLs from the origin: a page opened with a login in its address can't make relative requests.
+const api=p=>location.origin+p;
+const IMG=/\.(jpe?g|png|heic|heif|tiff?|webp)$/i;
+// Small batches: a whole school in one request can run past timeouts and
+// memory limits. ~40 MB or 25 files per request, whichever comes first.
+const MAX_BATCH_BYTES=40*1024*1024, MAX_BATCH_FILES=25;
+let batches=[], staged=[], schoolId=null, schoolName='', lastName='', showAll=false;
 
-function log(msg){ $('status').textContent += '\n'+msg; $('status').scrollTop=1e9; }
+function log(m){ const l=$('log'); l.hidden=false; l.textContent+=(l.textContent?'\n':'')+m; l.scrollTop=1e9; }
+function step(n){ ['s1','s2','s3'].forEach((id,i)=>{ $(id).className = i+1<n?'done':i+1===n?'on':''; }); }
 
-$('drop').onclick=()=>$('fileInput').click();
-['dragover','dragleave','drop'].forEach(ev=>{
-  $('drop').addEventListener(ev,e=>{e.preventDefault();$('drop').classList.toggle('over',ev==='dragover');});
-});
-$('drop').addEventListener('drop', async e=>{
-  const items=[...e.dataTransfer.items];
+const drop=$('drop');
+['dragover','dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.toggle('over',ev==='dragover');}));
+drop.addEventListener('drop', async e=>{
   const files=[];
-  async function walk(entry, path){
-    if(entry.isFile){
-      await new Promise(res=>entry.file(f=>{files.push({file:f, path:path+f.name}); res();}));
-    }else if(entry.isDirectory){
-      const reader=entry.createReader();
-      const entries=await new Promise(res=>reader.readEntries(res));
-      for(const en of entries) await walk(en, path+entry.name+'/');
+  async function walk(entry,path){
+    if(entry.isFile) await new Promise(r=>entry.file(f=>{files.push({file:f,path:path+f.name});r();}));
+    else if(entry.isDirectory){
+      const reader=entry.createReader(); let chunk;
+      do{ chunk=await new Promise(r=>reader.readEntries(r)); for(const en of chunk) await walk(en,path+entry.name+'/'); }while(chunk.length);
     }
   }
-  for(const it of items){
-    const entry=it.webkitGetAsEntry && it.webkitGetAsEntry();
-    if(entry) await walk(entry,'');
-  }
-  if(files.length) upload(files);
+  for(const it of [...e.dataTransfer.items]){ const en=it.webkitGetAsEntry&&it.webkitGetAsEntry(); if(en) await walk(en,''); }
+  start(files);
 });
-$('fileInput').onchange=e=>{
-  const files=[...e.target.files].map(f=>({file:f, path:f.webkitRelativePath||f.name}));
-  if(files.length) upload(files);
-};
+$('fileInput').onchange=e=>start([...e.target.files].map(f=>({file:f,path:f.webkitRelativePath||f.name})));
 
-async function upload(files){
-  $('status').textContent='';
-  log('Found '+files.length+' file(s). Uploading and processing — this runs GPS stripping,');
-  log('watermarking, and the full variant ladder on each real file, so it takes a moment.');
+async function start(all){
+  const files=all.filter(f=>IMG.test(f.path) && !f.path.split('/').some(p=>p.startsWith('.')));
+  if(!files.length){ log('No photos found in that folder.'); return; }
+  const top=new Set(files.map(f=>f.path.split('/')[0]));
+  if(top.size>1){ log('Please import one school folder at a time (found: '+[...top].join(', ')+').'); return; }
 
-  const fd=new FormData();
-  files.forEach(f=>{
-    fd.append('files', f.file);
-    fd.append('relativePaths', f.path);
-  });
-
-  const res=await fetch('/api/import/upload',{method:'POST',body:fd});
-  const data=await res.json();
-  if(!res.ok){ log('ERROR: '+data.error); return; }
-
-  batchId=data.batchId;
-  staged=data.staged;
-  schoolId=data.schoolId;
-  log('School detected: '+data.schoolName);
-  log('Processed '+staged.length+' of '+files.length+' file(s) successfully.');
-  if(staged.length<files.length) log((files.length-staged.length)+' failed — check the server log.');
-  log(data.autoMatched+' photo(s) matched automatically by folder name. '+data.needsTagging+' need a name.');
-  log('Folder parse: '+JSON.stringify(data.proposal.grades.map(g=>g.canonical+' ('+g.classes.map(c=>c.canonical+':'+c.fileCount).join(', ')+')')));
-
-  const seg=await (await fetch('/api/import/'+batchId+'/segment',{method:'POST'})).json();
-  if(seg.result.reviews && seg.result.reviews.length===0 && seg.autoMatchedCount===staged.length){
-    log('Every photo matched by folder name — nothing left to tag.');
+  drop.hidden=true; document.querySelector('.example').hidden=true; $('progressBox').hidden=false;
+  const groups=[]; let cur=[], bytes=0;
+  for(const f of files){
+    if(cur.length && (cur.length>=MAX_BATCH_FILES || bytes+f.file.size>MAX_BATCH_BYTES)){ groups.push(cur); cur=[]; bytes=0; }
+    cur.push(f); bytes+=f.file.size;
   }
+  if(cur.length) groups.push(cur);
 
-  renderTagging();
+  let done=0, failed=0;
+  for(const g of groups){
+    $('pmsg').textContent=`Uploading and watermarking… ${done} of ${files.length} photos`;
+    const fd=new FormData();
+    g.forEach(f=>{ fd.append('files',f.file); fd.append('relativePaths',f.path); });
+    let data;
+    for(let attempt=1;attempt<=3;attempt++){
+      try{
+        const r=await fetch(api('/api/import/upload'),{method:'POST',body:fd});
+        data=await r.json(); if(!r.ok) throw new Error(data.error||r.status);
+        break;
+      }catch(err){ data=null; if(attempt===3) log('A batch failed after 3 tries: '+err.message); else await new Promise(r=>setTimeout(r,1500*attempt)); }
+    }
+    if(data){
+      batches.push(data.batchId); staged.push(...data.staged);
+      schoolId=data.schoolId; schoolName=data.schoolName;
+      failed+=g.length-data.staged.length;
+    }else failed+=g.length;
+    done+=g.length;
+    $('bar').style.width=Math.round(done/files.length*100)+'%';
+  }
+  $('pmsg').textContent=`Uploaded ${staged.length} photo${staged.length===1?'':'s'} for ${schoolName}`+(failed?` — ${failed} could not be read`:'');
+  if(failed) log(failed+' file(s) were skipped (unreadable or not a photo).');
+  if(!staged.length){
+    $('pmsg').innerHTML='<span class="err">Nothing could be uploaded. Check your connection and try again.</span>';
+    drop.hidden=false; document.querySelector('.example').hidden=false; batches=[]; return;
+  }
+  step(2); review();
 }
 
-function renderTagging(){
-  $('tagStep').style.display='block';
-  $('stepLabel').textContent='Step 1 — done';
-  const grid=$('grid');
-  grid.innerHTML='';
-  staged.forEach(s=>{
+function review(){
+  $('reviewPanel').hidden=false;
+  const matched=staged.filter(s=>s.autoMatchedName);
+  const children=new Set(matched.map(s=>s.autoMatchedName));
+  const need=staged.length-matched.length;
+  $('summary').innerHTML=`<div><b>${schoolName}</b><span>School</span></div>
+    <div><b>${children.size}</b><span>Children found</span></div>
+    <div><b>${staged.length}</b><span>Photos</span></div>
+    <div><b style="color:${need?'var(--chinagraph)':'var(--green)'}">${need}</b><span>Need a name</span></div>`;
+  $('tagHint').hidden=!need;
+  showAll=!need; render();
+}
+
+function render(){
+  const grid=$('grid'); grid.innerHTML='';
+  $('toggleAll').textContent=showAll?'Show only photos that need a name':'Show all photos';
+  $('toggleAll').hidden=staged.every(s=>s.autoMatchedName)&&false;
+  const list=showAll?staged:staged.filter(s=>!s.autoMatchedName||s.tagged);
+  list.forEach(s=>{
     const el=document.createElement('div');
-    if(s.autoMatchedName){
-      // Matched automatically from the folder name — nothing to type.
+    if(s.autoMatchedName||s.tagged){
       el.className='card done';
-      el.innerHTML=`<img src="${s.thumbUrl}" alt="">
-        <div class="tag">
-          <div style="font-weight:600;padding:4px 0">${s.autoMatchedName}</div>
-          <div style="color:#12694A;font-size:11px">✓ Matched from folder name</div>
-        </div>`;
+      el.innerHTML=`<img src="${s.thumbUrl}" alt="" loading="lazy"><div class="tag"><b></b><div class="ok">✓ ${s.tagged?'Named':'From folder name'}</div></div>`;
+      el.querySelector('b').textContent=s.autoMatchedName||s.tagged;
     }else{
       el.className='card';
-      el.innerHTML=`<img src="${s.thumbUrl}" alt="">
-        <div class="tag">
-          <input placeholder="First name" class="fn">
-          <input placeholder="Last name" class="ln" value="${lastName}">
-          <button>Tag</button>
-        </div>`;
-      const btn=el.querySelector('button');
-      btn.onclick=async()=>{
-        const fn=el.querySelector('.fn').value.trim();
-        const ln=el.querySelector('.ln').value.trim();
-        if(!fn||!ln) return;
+      el.innerHTML=`<img src="${s.thumbUrl}" alt="" loading="lazy"><div class="tag">
+        <input placeholder="First name" class="fn" autocomplete="off"><input placeholder="Surname" class="ln" autocomplete="off"><button type="button">Save name</button></div>`;
+      el.querySelector('.ln').value=lastName;
+      el.querySelector('button').onclick=async()=>{
+        const fn=el.querySelector('.fn').value.trim(), ln=el.querySelector('.ln').value.trim();
+        if(!fn||!ln){ el.querySelector(fn?'.ln':'.fn').focus(); return; }
         lastName=ln;
-        const r=await fetch('/api/import/'+batchId+'/tag',{
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({fileId:s.id, firstName:fn, lastName:ln})
-        });
-        if(r.ok){ el.classList.add('done'); btn.textContent='✓ Tagged'; checkReady(); }
+        const r=await fetch(api('/api/import/x/tag'),{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({fileId:s.id,firstName:fn,lastName:ln})});
+        if(r.ok){ s.tagged=fn+' '+ln; render(); }
       };
     }
     grid.appendChild(el);
   });
-  checkReady();
+  const ready=staged.filter(s=>s.autoMatchedName||s.tagged).length;
+  $('commitBtn').disabled=ready===0;
+  $('commitBtn').textContent= ready===staged.length ? `Publish ${ready} photos` : `Publish ${ready} of ${staged.length} photos (unnamed ones are skipped)`;
 }
-function checkReady(){
-  const done=document.querySelectorAll('.card.done').length;
-  $('commitBtn').disabled = done===0;
-  $('commitBtn').textContent = done+' of '+staged.length+' ready — commit and generate claim codes';
-}
-$('commitBtn').onclick=async()=>{
-  $('commitBtn').disabled=true;
-  $('commitBtn').textContent='Committing…';
-  const r=await fetch('/api/import/'+batchId+'/commit',{method:'POST'});
-  const data=await r.json();
-  if(!r.ok){ log('COMMIT ERROR: '+data.error); return; }
-  log('Committed '+data.committed+' assets and issued '+data.claimCodes.length+' claim code(s).');
+$('toggleAll').onclick=()=>{ showAll=!showAll; render(); };
 
-  $('codesBox').style.display='block';
-  $('codesList').innerHTML=data.claimCodes.map(c=>`<div>${c.child} — <b>${c.grouped}</b></div>`).join('');
-  // Hand the photographer straight to the printable cards — the whole point
-  // is that the next step is obvious, not something to go hunting for.
-  if(schoolId){
-    $('cardsLink').href='/admin/cards/'+schoolId;
-    $('adminLink').href='/admin?school='+schoolId;
+$('commitBtn').onclick=async()=>{
+  const b=$('commitBtn'); b.disabled=true; b.textContent='Publishing…';
+  for(const id of batches){
+    const r=await fetch(api('/api/import/'+id+'/commit'),{method:'POST'});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok && !/Nothing to commit/.test(data.error||'')) log('Publishing a batch failed: '+(data.error||r.status));
   }
-  $('codesBox').scrollIntoView({behavior:'smooth'});
+  step(3);
+  $('reviewPanel').hidden=true; $('uploadPanel').hidden=true; $('donePanel').hidden=false;
+  $('doneMsg').textContent=`${schoolName} is live. Next: print the claim cards — children who don't have a card yet get one. Cards you printed before keep working.`;
+  if(schoolId){ $('cardsLink').href='/admin/cards/'+schoolId; $('schoolLink').href='/admin/schools/'+schoolId; }
 };
 </script>
 </body>

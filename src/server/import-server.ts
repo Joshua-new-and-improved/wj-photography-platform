@@ -1,6 +1,5 @@
 import express from "express";
 import multer from "multer";
-import QRCode from "qrcode";
 import { Pool } from "pg";
 import { randomUUID } from "node:crypto";
 
@@ -9,18 +8,19 @@ import { childFolderFromPath } from "../lib/import/childfolder.js";
 import { segmentBySlates, reviewSummary, type Frame } from "../lib/import/segment.js";
 import { deriveVariants } from "../lib/media/derive.js";
 import { putObject, publicUrl, randomKey } from "../lib/storage/local.js";
-import { issueClaimCode, redeemClaimCode, completeClaim } from "../lib/claim.js";
+import { redeemClaimCode, completeClaim } from "../lib/claim.js";
 import { generateOrderNumber, normaliseCode } from "../lib/ids.js";
 import { page, escapeHtml } from "./views.js";
-import { formatRands, parseRands, randsInputValue, FORMAT_RANDS_JS } from "../lib/commerce/money.js";
+import { formatRands, parseRands, FORMAT_RANDS_JS } from "../lib/commerce/money.js";
 import { getObject } from "../lib/storage/local.js";
 import { migrateOnBoot } from "./migrate.js";
+import { registerAdmin, backTo, KIND_LABEL } from "./admin.js";
 import {
   readParentSession, sessionCanViewChild, createAnonymousGuardian, grantChildToBrowser,
   probeRlsRole, rlsEnforcedForParents, asGuardianRls, type ParentSession,
 } from "./parent-auth.js";
 import {
-  WEBHOOK_PATH, handleYocoWebhook, startCheckout, settleOrder, saveYocoKey, yocoStatus, ensureYocoWebhook,
+  WEBHOOK_PATH, handleYocoWebhook, startCheckout, yocoStatus, ensureYocoWebhook,
 } from "./payments.js";
 
 /**
@@ -44,6 +44,7 @@ import {
  */
 
 const app = express();
+const bootState = { migrations: "pending" as string };
 const PORT = Number(process.env.PORT ?? 3000);
 
 const pool = new Pool({
@@ -929,7 +930,11 @@ app.post("/api/order", async (req, res) => {
                   exists(select 1 from package_item pi join product p2 on p2.id = pi.product_id
                           where pi.package_id = pk.id
                             and p2.kind in ('digital_single','digital_gallery')) as has_digital,
-                  pk.description_i18n->>'en' as description
+                  pk.description_i18n->>'en' as description,
+                  coalesce((select jsonb_agg(jsonb_build_object('name', p3.name_i18n->>'en', 'qty', pi2.quantity, 'kind', p3.kind)
+                                             order by pi2.sort_order)
+                              from package_item pi2 join product p3 on p3.id = pi2.product_id
+                             where pi2.package_id = pk.id), '[]'::jsonb) as contents
              from price pr join package pk on pk.id = pr.package_id
             where pr.price_list_id = $1 and pr.package_id = any($2::uuid[]) and pk.active = true`,
           [priceList.rows[0].id, wantPackages],
@@ -963,6 +968,7 @@ app.post("/api/order", async (req, res) => {
     const lines: Array<{
       kind: "product" | "package"; name: string; unitCents: number; qty: number;
       assetId: string | null; isDigital: boolean; allAssets?: string[];
+      productKind?: string; contents?: unknown[]; description?: string;
     }> = [];
 
     // Per-photo products: one line per photograph per product.
@@ -983,6 +989,7 @@ app.post("/api/order", async (req, res) => {
       for (const p of galleryProducts) {
         const cents = Number(p.amount_cents);
         lines.push({ kind: "product", name: p.name, unitCents: cents, qty: 1, assetId: null, isDigital: true,
+                     productKind: p.kind,
                      allAssets: all.rows.map((r) => r.asset_id as string) });
         subtotal += cents;
       }
@@ -991,7 +998,7 @@ app.post("/api/order", async (req, res) => {
       for (const p of perPhotoProducts) {
         const cents = Number(p.amount_cents);
         lines.push({
-          kind: "product", name: p.name, unitCents: cents, qty: 1, assetId,
+          kind: "product", name: p.name, unitCents: cents, qty: 1, assetId, productKind: p.kind,
           // The product's real `kind` column, not a substring match on its
           // name. Name-matching broke the moment a product was called
           // something sensible that happened not to contain the word.
@@ -1006,6 +1013,7 @@ app.post("/api/order", async (req, res) => {
       const cents = Number(p.amount_cents);
       lines.push({
         kind: "package", name: p.name, unitCents: cents, qty: 1, assetId: null,
+        contents: p.contents, description: p.description ?? "",
         // A package counts as digital if it actually contains a digital item.
         // The seeded packages have no package_item rows yet (their contents
         // are described in prose), so fall back to the description text —
@@ -1036,7 +1044,10 @@ app.post("/api/order", async (req, res) => {
           studioId, orderId, childId, lineNo++, l.qty, l.unitCents, l.unitCents * l.qty,
           // The snapshot is what makes an old order reconstructible even after
           // the catalogue changes (§11.1) — so it records the whole selection.
-          JSON.stringify({ name: l.name, assetId: l.assetId,
+          // Package contents ride along so the print list knows a package
+          // with a digital gallery ALSO contains prints to produce.
+          JSON.stringify({ name: l.name, assetId: l.assetId, productKind: l.productKind,
+                           contents: l.contents, description: l.description,
                            assetIds: l.allAssets ?? (l.kind === "package" ? assetIds : undefined) }),
           l.isDigital ? "digital" : "physical",
           l.kind,
@@ -1213,362 +1224,7 @@ app.get("/download/:grantId", async (req, res) => {
 // ADMIN — multi-school, with everything editable
 // ============================================================================
 
-function paymentsPanel(y: Awaited<ReturnType<typeof yocoStatus>>): string {
-  const input = `<input name="secret_key" type="password" autocomplete="off" placeholder="sk_live_… or sk_test_…"
-       style="flex:1;min-width:240px;padding:9px;border:1px solid var(--rule);border-radius:2px">`;
-  if (!y.connected) {
-    return `<div class="note">Not connected — parents can order, and you confirm payment with "Mark paid".
-        To take card payments, paste your <b>secret key</b> from the Yoco app
-        (Yoco Connect → Checkout API → How to connect). Everything else is set up automatically.
-        ${y.lastError ? `<br><span style="color:var(--chinagraph)">${escapeHtml(y.lastError)}</span>` : ""}</div>
-      <form method="post" action="/admin/payments" style="display:flex;gap:6px;flex-wrap:wrap;max-width:560px">
-        ${input}<button type="submit" class="btn" style="width:auto;padding:9px 16px">Connect Yoco</button></form>`;
-  }
-  const mode = y.mode === "live" ? `<span class="pill ok">Live</span>` : `<span class="pill">Test mode</span>`;
-  const hook = y.webhookReady
-    ? `<span class="pill ok">Automatic confirmation on</span>`
-    : `<span class="pill">Automatic confirmation not set up</span>`;
-  return `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">${mode} ${hook}</div>
-    ${y.mode === "test" ? `<div class="note">Test mode: no real money moves. Switch to your live key once Yoco has verified this website.</div>` : ""}
-    ${y.lastError && !y.webhookReady ? `<div class="note" style="color:var(--chinagraph)">${escapeHtml(y.lastError)}</div>` : ""}
-    ${y.source === "env"
-      ? `<div class="note">The key is set on the server (YOCO_SECRET_KEY), so it can't be changed here.</div>`
-      : `<form method="post" action="/admin/payments" style="display:flex;gap:6px;flex-wrap:wrap;max-width:560px">
-           ${input}<button type="submit" class="btn" style="width:auto;padding:9px 16px">Replace key</button></form>
-         <form method="post" action="/admin/payments" style="margin-top:6px"
-               onsubmit="return confirm('Disconnect Yoco? Parents will no longer be able to pay by card.')">
-           <input type="hidden" name="secret_key" value=""><button type="submit" class="pill">Disconnect</button></form>`}`;
-}
-
-app.post("/admin/payments", async (req, res) => {
-  const { studioId } = await ensureStudioAndStaff();
-  if (process.env.YOCO_SECRET_KEY) return res.redirect(303, "/admin");
-  await saveYocoKey(pool, studioId, String(req.body.secret_key ?? ""));
-  res.redirect(303, "/admin");
-});
-
-app.get("/admin", async (req, res) => {
-  const { studioId } = await ensureStudioAndStaff();
-
-  const schools = await pool.query(
-    `select id, name, display_name, commission_bps,
-            (select count(*) from child c where c.school_id = school.id) as children
-       from school where studio_id = $1 order by name`,
-    [studioId],
-  );
-
-  if (schools.rowCount === 0) {
-    return res.send(page({
-      title: "Studio", nav: NAV,
-      body: `<div class="sheet-head"><div class="kid"><h1>Studio</h1></div></div>
-        <div class="empty">No schools yet — <a href="/import.html" style="text-decoration:underline">
-          run an import</a>. The school is detected automatically from the top folder name.</div>`,
-    }));
-  }
-
-  const notice = req.query.saved
-    ? { ok: true, text: String(req.query.saved) }
-    : req.query.error
-    ? { ok: false, text: String(req.query.error) }
-    : null;
-  const selectedId = (req.query.school as string) || schools.rows[0].id;
-  const selected = schools.rows.find((s) => s.id === selectedId) ?? schools.rows[0];
-
-  const counts = await pool.query(
-    `select
-       (select count(*) from child where school_id = $1) as children,
-       (select count(*) from asset a join shoot sh on sh.id = a.shoot_id where sh.school_id = $1) as assets,
-       (select count(*) from claim_code cc join child c on c.id = cc.child_id where c.school_id = $1) as codes_issued,
-       (select count(*) from claim_code cc join child c on c.id = cc.child_id
-          where c.school_id = $1 and cc.redeemed_at is not null) as codes_redeemed`,
-    [selected.id],
-  );
-  const n = counts.rows[0];
-
-  // Search across children by name. Uses app.immutable_unaccent so that a
-  // parent or staff member typing "Zane" finds "Zané" — the exact case §13
-  // built the unaccent index for. Also matches on the full name, so "Botha"
-  // and "Noah Botha" both work.
-  const q = ((req.query.q as string) || "").trim();
-  const children = q
-    ? await pool.query(
-        `select c.id, c.first_name, c.last_name,
-                (select count(*) from gallery_item gi where gi.child_id = c.id) as photo_count,
-                exists(select 1 from claim_code cc where cc.child_id = c.id and cc.redeemed_at is not null) as claimed
-           from child c
-          where c.school_id = $1
-            and app.immutable_unaccent(c.first_name || ' ' || c.last_name)
-                ilike '%' || app.immutable_unaccent($2) || '%'
-          order by c.last_name, c.first_name`,
-        [selected.id, q],
-      )
-    : await pool.query(
-        `select c.id, c.first_name, c.last_name,
-                (select count(*) from gallery_item gi where gi.child_id = c.id) as photo_count,
-                exists(select 1 from claim_code cc where cc.child_id = c.id and cc.redeemed_at is not null) as claimed
-           from child c where c.school_id = $1 order by c.last_name, c.first_name`,
-        [selected.id],
-      );
-
-  const products = await pool.query(
-    `select id, sku, name_i18n->>'en' as name, kind, active from product where studio_id = $1
-      order by active desc, name_i18n->>'en'`,
-    [studioId],
-  );
-  const packages = await pool.query(
-    `select pk.id, pk.name_i18n->>'en' as name, pk.description_i18n->>'en' as description, pk.active,
-            (select pr.amount_cents from price pr join price_list pl on pl.id = pr.price_list_id
-              where pr.package_id = pk.id and pl.status = 'published'
-              order by pl.effective_from desc limit 1) as amount_cents,
-            coalesce((select jsonb_object_agg(pi.product_id, pi.quantity) from package_item pi
-                       where pi.package_id = pk.id), '{}'::jsonb) as items
-       from package pk where pk.studio_id = $1
-      order by pk.active desc, pk.sort_order, pk.name_i18n->>'en'`,
-    [studioId],
-  );
-  const priceList = await pool.query(
-    `select id from price_list where studio_id = $1 and status = 'published' order by effective_from desc limit 1`,
-    [studioId],
-  );
-  const prices = priceList.rows[0]
-    ? await pool.query(
-        `select p.product_id, p.amount_cents from price p where p.price_list_id = $1`,
-        [priceList.rows[0].id],
-      )
-    : { rows: [] };
-  const priceByProduct = new Map(prices.rows.map((r: any) => [r.product_id, r.amount_cents]));
-
-  const yoco = await yocoStatus(pool, studioId);
-  const orders = await pool.query(
-    `select o.id, o.order_number, o.total_cents, o.payment_status, o.digital_status,
-            o.fulfilment_status, coalesce(o.contact_email, g.email) as email
-       from "order" o join guardian g on g.id = o.guardian_id
-      where o.school_id = $1 order by o.placed_at desc limit 50`,
-    [selected.id],
-  );
-
-  const schoolTabs = schools.rows
-    .map(
-      (s) => `<a class="navlink" href="/admin?school=${s.id}" style="${
-        s.id === selected.id ? "color:var(--graphite);border-bottom:2px solid var(--chinagraph)" : ""
-      }">${escapeHtml(s.display_name || s.name)} <span class="mono" style="color:var(--silver)">(${s.children})</span></a>`,
-    )
-    .join("");
-
-  res.send(
-    page({
-      title: `Studio — ${selected.display_name || selected.name}`,
-      nav: NAV,
-      body: `
-      <div class="sheet-head">
-        <div class="kid"><h1>${escapeHtml(selected.display_name || selected.name)}</h1></div>
-        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:12px">${schoolTabs}
-          <a class="navlink" href="/import.html">+ Import another school</a></div>
-      </div>
-
-      <div class="stats">
-        <div class="stat"><div class="n">${n.children}</div><div class="l">Children</div></div>
-        <div class="stat"><div class="n">${n.assets}</div><div class="l">Photographs</div></div>
-        <div class="stat"><div class="n">${n.codes_redeemed}/${n.codes_issued}</div><div class="l">Codes claimed</div></div>
-      </div>
-
-      <div class="sectlabel"><span>Card payments (Yoco)</span></div>
-      ${paymentsPanel(yoco)}
-
-      <div class="sectlabel"><span>School details</span></div>
-      <form method="post" action="/admin/school/${selected.id}" style="display:grid;gap:8px;max-width:420px">
-        <label class="mono" style="font-size:11px;color:var(--silver)">Name parents see</label>
-        <input name="display_name" value="${escapeHtml(selected.display_name || "")}"
-               placeholder="${escapeHtml(selected.name)}"
-               style="padding:9px;border:1px solid var(--rule);border-radius:2px">
-        <label class="mono" style="font-size:11px;color:var(--silver)">School commission (%)</label>
-        <input name="commission_pct" type="number" step="0.1" value="${(selected.commission_bps / 100).toFixed(1)}"
-               style="padding:9px;border:1px solid var(--rule);border-radius:2px;max-width:120px">
-        <button type="submit" class="btn" style="max-width:160px">Save school</button>
-      </form>
-
-      ${notice ? `<div class="flash ${notice.ok ? "ok" : ""}">${escapeHtml(notice.text)}</div>` : ""}
-      <div class="sectlabel" id="products"><span>Products &amp; prices</span></div>
-      <p class="hint">Prices are in Rands, VAT included — type <b>145</b> or <b>145,50</b>. Per-photo items are
-        charged once for every photograph the parent picks.</p>
-      ${products.rows
-        .map((p) => `<form id="p-${p.id}" method="post" action="/admin/product/${p.id}"></form>`)
-        .join("")}
-      <div class="tablewrap"><table class="edit"><thead><tr><th>Product</th><th>Type</th><th>Price</th><th>On sale</th><th></th></tr></thead><tbody>
-        ${products.rows
-          .map(
-            (p) => `<tr class="${p.active ? "" : "off"}">
-              <td><input form="p-${p.id}" name="name" value="${escapeHtml(p.name)}" required aria-label="Product name">
-                  <div class="sku">${escapeHtml(p.sku)}</div></td>
-              <td><span class="pill">${escapeHtml(KIND_LABEL[p.kind] ?? p.kind)}</span></td>
-              <td><label class="rands"><span>R</span><input form="p-${p.id}" name="price" inputmode="decimal"
-                    value="${randsInputValue(priceByProduct.get(p.id))}" required aria-label="Price in Rands"></label></td>
-              <td><input form="p-${p.id}" type="checkbox" name="active" ${p.active ? "checked" : ""} aria-label="On sale"></td>
-              <td><button form="p-${p.id}" type="submit" class="pill">Save</button></td>
-            </tr>`,
-          )
-          .join("")}
-      </tbody></table></div>
-      <form method="post" action="/admin/product" class="addrow">
-        <input name="name" placeholder="New product, e.g. A4 Print" required>
-        <select name="kind" aria-label="Type">
-          <option value="print">Print (per photo)</option>
-          <option value="merch">Gift / merchandise (per photo)</option>
-          <option value="digital_single">Digital image (per photo)</option>
-          <option value="digital_gallery">Full digital gallery</option>
-        </select>
-        <label class="rands"><span>R</span><input name="price" inputmode="decimal" placeholder="145" required aria-label="Price in Rands"></label>
-        <button type="submit" class="btn small">Add product</button>
-      </form>
-
-      <div class="sectlabel" id="packages"><span>Packages</span></div>
-      <p class="hint">A package is one price for a bundle. Tick what's in it — digital items are released to
-        the parent the moment they pay. Packages that are off are hidden from parents.</p>
-      ${packages.rows.length ? packages.rows.map((pk) => packageEditor(pk, products.rows)).join("") : `<div class="empty">No packages yet.</div>`}
-      <details class="newpkg"><summary class="btn small">+ New package</summary>
-        <form method="post" action="/admin/package" class="pkgform">
-          <label>Name<input name="name" placeholder="e.g. Platinum" required></label>
-          <label>Price<span class="rands"><span>R</span><input name="price" inputmode="decimal" placeholder="1 200" required></span></label>
-          <label class="wide">What parents read<input name="description" placeholder="e.g. Everything in Gold plus an A3 print"></label>
-          <button type="submit" class="btn small">Create package</button>
-        </form>
-      </details>
-
-      <div class="sectlabel"><span>Orders</span></div>
-      ${
-        orders.rowCount === 0
-          ? `<div class="empty">No orders yet.</div>`
-          : `<table><thead><tr><th>Order</th><th>Guardian</th><th>Total</th>
-              <th>Payment</th><th>Digital</th><th>Prints</th><th></th></tr></thead><tbody>
-          ${orders.rows
-            .map(
-              (o) => `<tr>
-                <td class="mono">${escapeHtml(o.order_number)}</td>
-                <td>${escapeHtml(o.email)}</td>
-                <td class="mono">${formatRands(o.total_cents)}</td>
-                <td><span class="pill ${o.payment_status === "settled" ? "ok" : ""}">${escapeHtml(o.payment_status)}</span></td>
-                <td><span class="pill ${o.digital_status === "delivered" ? "ok" : ""}">${escapeHtml(o.digital_status)}</span></td>
-                <td><span class="pill ${o.fulfilment_status === "completed" ? "ok" : ""}">${escapeHtml(o.fulfilment_status)}</span></td>
-                <td>${
-                  o.payment_status !== "settled"
-                    ? `<form method="post" action="/admin/order/${o.id}/mark-paid" style="display:inline">
-                         <button type="submit" class="pill">Mark paid</button></form>`
-                    : ""
-                }</td>
-              </tr>`,
-            )
-            .join("")}
-          </tbody></table>
-          <div class="note">Card payments through Yoco settle automatically and release digital
-            photographs to the parent straight away. Use "Mark paid" only for cash or EFT — it does
-            exactly the same thing.</div>`
-      }
-
-      <div class="sectlabel"><span>Children</span></div>
-      <form method="get" action="/admin" style="display:flex;gap:6px;margin-bottom:10px;max-width:420px">
-        <input type="hidden" name="school" value="${selected.id}">
-        <input name="q" value="${escapeHtml(q)}" placeholder="Search by name…"
-               style="flex:1;padding:9px;border:1px solid var(--rule);border-radius:2px">
-        <button type="submit" class="btn" style="width:auto;padding:9px 16px">Search</button>
-        ${q ? `<a href="/admin?school=${selected.id}" class="navlink" style="align-self:center">Clear</a>` : ""}
-      </form>
-      ${q ? `<div class="mono" style="font-size:11px;color:var(--silver);margin-bottom:8px">
-              ${children.rowCount} result(s) for "${escapeHtml(q)}"</div>` : ""}
-      ${
-        children.rowCount === 0
-          ? q
-            ? `<div class="empty">No children match "${escapeHtml(q)}".</div>`
-            : `<div class="empty">No children at this school yet.</div>`
-          : `<table><thead><tr><th>Name</th><th>Photographs</th><th>Gallery</th><th>Claim cards</th><th>Claimed</th></tr></thead><tbody>
-          ${children.rows
-            .map(
-              (r) => `<tr>
-                <td>${escapeHtml(r.first_name)} ${escapeHtml(r.last_name)}</td>
-                <td>${r.photo_count}</td>
-                <td><a href="/admin/preview/${r.id}" style="text-decoration:underline">Preview gallery →</a></td>
-                <td><a href="/admin/cards/${selected.id}" style="text-decoration:underline">Print sheet →</a></td>
-                <td><span class="pill ${r.claimed ? "ok" : ""}">${r.claimed ? "Claimed" : "Not yet"}</span></td>
-              </tr>`,
-            )
-            .join("")}
-          </tbody></table>`
-      }
-      <div class="note">Switch schools with the tabs above. A new school needs no setup — drag its
-        folder into the importer and it appears here automatically.</div>`,
-    }),
-  );
-});
-
-app.post("/admin/order/:id/mark-paid", async (req, res) => {
-  if (!UUID_RE.test(req.params.id)) return res.status(404).send("Unknown order.");
-  const client = await pool.connect();
-  try {
-    await client.query("begin");
-    await client.query("select set_config('app.actor_kind', 'system', true)");
-    // Same path as a Yoco webhook: settle, then grant digital downloads.
-    // The digital-release gate (0013) still refuses delivery while unpaid.
-    await settleOrder(client, req.params.id);
-    const school = await client.query(`select school_id from "order" where id = $1`, [req.params.id]);
-    await client.query("commit");
-    res.redirect(`/admin?school=${school.rows[0].school_id}`);
-  } catch (err) {
-    await client.query("rollback").catch(() => {});
-    console.error(err);
-    res.status(500).send("Error marking order paid: " + escapeHtml((err as Error).message));
-  } finally {
-    client.release();
-  }
-});
-
-app.post("/admin/school/:id", async (req, res) => {
-  const { display_name, commission_pct } = req.body;
-  const bps = Math.round(Number(commission_pct || 0) * 100);
-  await pool.query(
-    `update school set display_name = $1, commission_bps = $2 where id = $3`,
-    [display_name || null, bps, req.params.id],
-  );
-  res.redirect(`/admin?school=${req.params.id}`);
-});
-
-const KIND_LABEL: Record<string, string> = {
-  print: "Print",
-  merch: "Gift",
-  digital_single: "Digital",
-  digital_gallery: "Digital gallery",
-};
-
-function packageEditor(pk: any, products: any[]): string {
-  const items = (pk.items ?? {}) as Record<string, number>;
-  const rows = products
-    .filter((p) => p.active || items[p.id])
-    .map(
-      (p) => `<label class="pkgitem"><input type="number" name="qty_${p.id}" min="0" max="99"
-          value="${items[p.id] ?? 0}" inputmode="numeric" aria-label="Quantity of ${escapeHtml(p.name)}">
-        <span>${escapeHtml(p.name)}</span></label>`,
-    )
-    .join("");
-  return `<form method="post" action="/admin/package/${pk.id}" class="pkgcard ${pk.active ? "" : "off"}">
-    <div class="pkgform">
-      <label>Name<input name="name" value="${escapeHtml(pk.name)}" required></label>
-      <label>Price<span class="rands"><span>R</span><input name="price" inputmode="decimal"
-        value="${randsInputValue(pk.amount_cents)}" required></span></label>
-      <label class="wide">What parents read<input name="description" value="${escapeHtml(pk.description ?? "")}"
-        placeholder="Left empty, this is written from the contents below"></label>
-    </div>
-    <div class="pkglabel">Contents <span>— how many of each</span></div>
-    <div class="pkgitems">${rows}</div>
-    <div class="pkgfoot">
-      <label class="toggle"><input type="checkbox" name="active" ${pk.active ? "checked" : ""}> Offered to parents</label>
-      <button type="submit" class="btn small">Save package</button>
-    </div>
-  </form>`;
-}
-
-/** Back to the admin section the form came from, with a message. */
-function backTo(res: express.Response, anchor: string, msg: { saved?: string; error?: string }) {
-  const q = msg.error ? `error=${encodeURIComponent(msg.error)}` : `saved=${encodeURIComponent(msg.saved ?? "Saved.")}`;
-  res.redirect(303, `/admin?${q}#${anchor}`);
-}
+registerAdmin(app, { pool, ensureStudioAndStaff, findOrCreateShoot, bootState });
 
 const BAD_PRICE = "That price wasn't understood. Type it in Rands, like 145 or 145,50.";
 
@@ -1577,9 +1233,9 @@ app.post("/admin/product", async (req, res) => {
   const name = String(req.body.name ?? "").trim();
   const kind = String(req.body.kind ?? "print");
   const cents = parseRands(req.body.price);
-  if (!name) return backTo(res, "products", { error: "Give the product a name." });
-  if (!KIND_LABEL[kind]) return backTo(res, "products", { error: "Unknown product type." });
-  if (cents === null) return backTo(res, "products", { error: BAD_PRICE });
+  if (!name) return backTo(res, "/admin/catalogue#products", { error: "Give the product a name." });
+  if (!KIND_LABEL[kind]) return backTo(res, "/admin/catalogue#products", { error: "Unknown product type." });
+  if (cents === null) return backTo(res, "/admin/catalogue#products", { error: BAD_PRICE });
 
   // The SKU is an internal reference nobody should have to invent; derive a
   // unique one from the name.
@@ -1595,22 +1251,22 @@ app.post("/admin/product", async (req, res) => {
     [studioId, sku, name, kind],
   );
   await setPrice(studioId, { productId: p.rows[0].id }, cents);
-  backTo(res, "products", { saved: `${name} added at ${formatRands(cents)}.` });
+  backTo(res, "/admin/catalogue#products", { saved: `${name} added at ${formatRands(cents)}.` });
 });
 
 app.post("/admin/product/:id", async (req, res) => {
-  if (!UUID_RE.test(req.params.id)) return backTo(res, "products", { error: "Unknown product." });
+  if (!UUID_RE.test(req.params.id)) return backTo(res, "/admin/catalogue#products", { error: "Unknown product." });
   const { studioId } = await ensureStudioAndStaff();
   const name = String(req.body.name ?? "").trim();
   const cents = parseRands(req.body.price);
-  if (!name) return backTo(res, "products", { error: "A product needs a name." });
-  if (cents === null) return backTo(res, "products", { error: BAD_PRICE });
+  if (!name) return backTo(res, "/admin/catalogue#products", { error: "A product needs a name." });
+  if (cents === null) return backTo(res, "/admin/catalogue#products", { error: BAD_PRICE });
   await pool.query(
     `update product set name_i18n = jsonb_build_object('en', $1::text), active = $2 where id = $3 and studio_id = $4`,
     [name, req.body.active === "on", req.params.id, studioId],
   );
   await setPrice(studioId, { productId: req.params.id }, cents);
-  backTo(res, "products", { saved: `${name} saved — ${formatRands(cents)}${req.body.active === "on" ? "" : ", not on sale"}.` });
+  backTo(res, "/admin/catalogue#products", { saved: `${name} saved — ${formatRands(cents)}${req.body.active === "on" ? "" : ", not on sale"}.` });
 });
 
 /**
@@ -1679,8 +1335,8 @@ app.post("/admin/package", async (req, res) => {
   const { studioId } = await ensureStudioAndStaff();
   const name = String(req.body.name ?? "").trim();
   const cents = parseRands(req.body.price);
-  if (!name) return backTo(res, "packages", { error: "Give the package a name." });
-  if (cents === null) return backTo(res, "packages", { error: BAD_PRICE });
+  if (!name) return backTo(res, "/admin/catalogue#packages", { error: "Give the package a name." });
+  if (cents === null) return backTo(res, "/admin/catalogue#packages", { error: BAD_PRICE });
   const r = await pool.query(
     `insert into package (studio_id, name_i18n, description_i18n, active, sort_order)
      values ($1, jsonb_build_object('en', $2::text), jsonb_build_object('en', $3::text), false,
@@ -1689,18 +1345,18 @@ app.post("/admin/package", async (req, res) => {
     [studioId, name, String(req.body.description ?? "").trim()],
   );
   await setPrice(studioId, { packageId: r.rows[0].id }, cents);
-  backTo(res, "packages", { saved: `${name} created. Tick what's in it, switch it on, and save.` });
+  backTo(res, "/admin/catalogue#packages", { saved: `${name} created. Tick what's in it, switch it on, and save.` });
 });
 
 app.post("/admin/package/:id", async (req, res) => {
-  if (!UUID_RE.test(req.params.id)) return backTo(res, "packages", { error: "Unknown package." });
+  if (!UUID_RE.test(req.params.id)) return backTo(res, "/admin/catalogue#packages", { error: "Unknown package." });
   const { studioId } = await ensureStudioAndStaff();
   const name = String(req.body.name ?? "").trim();
   const cents = parseRands(req.body.price);
-  if (!name) return backTo(res, "packages", { error: "A package needs a name." });
-  if (cents === null) return backTo(res, "packages", { error: BAD_PRICE });
+  if (!name) return backTo(res, "/admin/catalogue#packages", { error: "A package needs a name." });
+  if (cents === null) return backTo(res, "/admin/catalogue#packages", { error: BAD_PRICE });
   const owned = await pool.query(`select 1 from package where id = $1 and studio_id = $2`, [req.params.id, studioId]);
-  if (owned.rowCount === 0) return backTo(res, "packages", { error: "Unknown package." });
+  if (owned.rowCount === 0) return backTo(res, "/admin/catalogue#packages", { error: "Unknown package." });
 
   await savePackageContents(studioId, req.params.id, req.body);
   const description = String(req.body.description ?? "").trim() || (await describeContents(req.params.id));
@@ -1711,86 +1367,7 @@ app.post("/admin/package/:id", async (req, res) => {
     [name, description, req.body.active === "on", req.params.id],
   );
   await setPrice(studioId, { packageId: req.params.id }, cents);
-  backTo(res, "packages", { saved: `${name} saved — ${formatRands(cents)}${req.body.active === "on" ? "" : ", hidden from parents"}.` });
-});
-
-// ── Printable claim-code sheet, with real QR codes ───────────────────────────
-// Generated on demand rather than at commit time and cached: it needs the
-// plaintext code, which the database never stores (§6.2 — only the Argon2id
-// hash is kept). So this page re-issues a fresh claim code for any child who
-// does not already have a live one — visiting it is itself the "regenerate
-// codes" action for children who have not been printed yet, and is a no-op
-// (existing code shown as already issued, no plaintext available to reprint)
-// for anyone who already has a live code from a previous visit or import.
-app.get("/admin/cards/:schoolId", async (req, res) => {
-  const { studioId, staffId } = await ensureStudioAndStaff();
-  const client = await pool.connect();
-  try {
-    const schoolId = req.params.schoolId;
-    const shootId = await findOrCreateShoot(studioId, schoolId);
-
-    const children = await pool.query(
-      `select c.id, c.first_name, c.last_name, cl.name as class_name, g.name as grade_name,
-              exists(select 1 from claim_code cc where cc.child_id = c.id
-                       and cc.shoot_id = $2 and cc.revoked_at is null and cc.redeemed_at is null
-                       and cc.expires_at > now()) as has_live_code
-         from child c
-         left join enrolment e on e.child_id = c.id
-         left join class_group cl on cl.id = e.class_group_id
-         left join grade g on g.id = cl.grade_id
-        where c.school_id = $1 order by g.sort_order, cl.name, c.last_name`,
-      [schoolId, shootId],
-    );
-
-    await client.query("select set_config('app.actor_kind', 'staff', true)");
-    await client.query("select set_config('app.studio_id', $1, true)", [studioId]);
-    await client.query("select set_config('app.staff_id', $1, true)", [staffId]);
-    await client.query("select set_config('app.staff_role', 'photographer', true)");
-
-    const host = req.protocol + "://" + req.get("host");
-    const cards: string[] = [];
-    for (const c of children.rows) {
-      let grouped: string | null = null;
-      if (!c.has_live_code) {
-        const issued = await issueClaimCode(client, {
-          studioId, childId: c.id, shootId, expiresAt: new Date(Date.now() + 60 * 24 * 3_600_000),
-        });
-        grouped = issued.grouped;
-      }
-      const qrTarget = grouped ? `${host}/?code=${grouped}` : `${host}/`;
-      const qrPng = await QRCode.toDataURL(qrTarget, { margin: 1, width: 200 });
-      cards.push(`
-        <div class="card" style="break-inside:avoid;display:inline-block;width:260px;margin:6px;
-             border:1px solid var(--rule);border-radius:4px;padding:14px;vertical-align:top">
-          <div style="font-weight:600;font-size:15px">${escapeHtml(c.first_name)} ${escapeHtml(c.last_name)}</div>
-          <div class="mono" style="font-size:11px;color:var(--silver);margin-bottom:8px">
-            ${escapeHtml(c.grade_name ?? "")} ${escapeHtml(c.class_name ?? "")}</div>
-          <img src="${qrPng}" style="width:140px;height:140px;display:block;margin:0 auto">
-          <div class="mono" style="text-align:center;font-size:14px;font-weight:600;margin-top:8px">
-            ${grouped ? escapeHtml(grouped) : '<span style="color:var(--silver)">already issued</span>'}
-          </div>
-        </div>`);
-    }
-
-    res.send(
-      page({
-        title: "Claim cards",
-        nav: NAV,
-        body: `
-        <div class="sheet-head"><div class="kid"><h1>Claim cards</h1></div></div>
-        <p style="margin-bottom:14px">Print this page (Cmd/Ctrl+P). One card per child — QR code plus
-          the human-readable fallback. Cards already issued in a previous visit show
-          "already issued": their code is hashed in the database and cannot be redisplayed, by design.</p>
-        <button class="btn" style="width:auto;padding:10px 20px;margin-bottom:16px" onclick="window.print()">Print</button>
-        <div>${cards.join("")}</div>`,
-      }),
-    );
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Error generating cards: " + (err as Error).message);
-  } finally {
-    client.release();
-  }
+  backTo(res, "/admin/catalogue#packages", { saved: `${name} saved — ${formatRands(cents)}${req.body.active === "on" ? "" : ", hidden from parents"}.` });
 });
 
 // ============================================================================
@@ -2003,6 +1580,10 @@ app.post("/api/import/:batchId/tag", async (req, res) => {
     const { studio_id: studioId, school_id: schoolId } = info.rows[0];
 
     const childId = await findOrCreateChild(studioId, schoolId, firstName, lastName);
+    // A stray photo still sits in a grade/class folder; use it for the class.
+    const path = (await pool.query(`select relative_path from import_file where id = $1`, [fileId])).rows[0]?.relative_path ?? "";
+    const segs = String(path).split("/");
+    if (segs.length >= 4) await ensureEnrolment(studioId, schoolId, childId, segs[1]!, segs[2]!);
 
     await pool.query(`update import_file set status = 'processed' where id = $1`, [fileId]);
     TAG_MAP.set(fileId, childId!);
@@ -2036,8 +1617,6 @@ app.post("/api/import/:batchId/commit", async (req, res) => {
     const shootId = files[0].shoot_id as string;
     const { staffId } = await ensureStudioAndStaff();
 
-    const claimCodes: Array<{ child: string; grouped: string }> = [];
-    const childCodeCache = new Map<string, string>();
 
     await client.query("select set_config('app.actor_kind', 'staff', true)");
     await client.query("select set_config('app.staff_id', $1, true)", [staffId]);
@@ -2076,16 +1655,11 @@ app.post("/api/import/:batchId/commit", async (req, res) => {
           [f.studio_id, assetId, childId, "filename"],
         );
 
-        if (!childCodeCache.has(childId)) {
-          await client.query("select set_config('app.studio_id', $1, true)", [f.studio_id]);
-          const issued = await issueClaimCode(client, {
-            studioId: f.studio_id, childId, shootId,
-            expiresAt: new Date(Date.now() + 30 * 24 * 3_600_000),
-          });
-          childCodeCache.set(childId, issued.grouped);
-          const c = await client.query(`select first_name, last_name from child where id = $1`, [childId]);
-          claimCodes.push({ child: `${c.rows[0].first_name} ${c.rows[0].last_name}`, grouped: issued.grouped });
-        }
+        // Claim codes are NOT issued here. They are issued by the claim-card
+        // page at the moment it can print them: a code's plaintext exists
+        // only once (it is stored hashed), so a code issued here could never
+        // be put on a printed QR card. Importing more photos later therefore
+        // never touches a card already handed out.
       }
 
       await client.query(`update import_file set status = 'committed', asset_id = $1 where id = $2`, [assetId, f.id]);
@@ -2094,7 +1668,8 @@ app.post("/api/import/:batchId/commit", async (req, res) => {
     await client.query(`update import_batch set status = 'committed', committed_at = now() where id = $1`, [batchId]);
     await client.query("commit");
 
-    res.json({ committed: files.length, claimCodes, shootId });
+    const schoolId = (await pool.query(`select school_id from shoot where id = $1`, [shootId])).rows[0]?.school_id;
+    res.json({ committed: files.length, shootId, schoolId });
   } catch (err) {
     await client.query("rollback");
     console.error(err);
@@ -2203,7 +1778,39 @@ app.post("/admin/api/school/:id/delete", requireStaffAuth, async (req, res) => {
   }
 });
 
-const bootState = { migrations: "pending" as string };
+
+/**
+ * The starter packages were seeded with their contents only in prose, so the
+ * system could not tell what to print or which digitals to release. Where the
+ * prose is exact, record it as real contents — once, and only if Wiaan hasn't
+ * edited the package (no items yet, description still the seeded text).
+ * "Silver" says "5 mixed prints", which cannot be turned into sizes without
+ * guessing, so it is left for him to tick (the Overview reminds him).
+ */
+async function structureStarterPackages(studioId: string) {
+  const starters: Array<[string, Array<[string, number]>]> = [
+    ["2 × 10×15 prints and 1 digital image", [["PRINT-10X15", 2], ["DIGITAL-single", 1]]],
+    ["Canvas, mug, keyring, full digital gallery and 4 × A5 prints",
+      [["CANVAS", 1], ["MUG", 1], ["KEYRING", 1], ["DIGITAL-gallery", 1], ["PRINT-A5", 4]]],
+  ];
+  for (const [description, items] of starters) {
+    const pk = await pool.query(
+      `select pk.id from package pk where pk.studio_id = $1 and pk.description_i18n->>'en' = $2
+          and not exists (select 1 from package_item pi where pi.package_id = pk.id)`,
+      [studioId, description],
+    );
+    for (const row of pk.rows) {
+      let order = 0;
+      for (const [sku, qty] of items) {
+        await pool.query(
+          `insert into package_item (studio_id, package_id, product_id, quantity, sort_order)
+           select $1, $2, id, $4, $5 from product where studio_id = $1 and sku = $3`,
+          [studioId, row.id, sku, qty, order++],
+        );
+      }
+    }
+  }
+}
 
 // Boot: bring the schema up to date, find out whether the database can
 // enforce parent isolation itself, and make sure Yoco knows where to call.
@@ -2213,6 +1820,7 @@ bootState.migrations = migration.status;
 await probeRlsRole(pool);
 try {
   const { studioId } = await ensureStudioAndStaff();
+  await structureStarterPackages(studioId);
   await ensureYocoWebhook(pool, studioId);
 } catch (err) {
   console.error({ event: "boot.payments", err: (err as Error).message });
